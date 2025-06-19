@@ -8,17 +8,18 @@ import logging
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 import math
+import sys # Import sys untuk mengatur rekursi limit
 
 # --- KONFIGURASI ---
 PAIR = 'BTCUSDT'
-STEP = 100
+STEP = 10
 DEPTH = 1000
 
-WALL_THRESHOLD_MAIN = 1000
-WALL_THRESHOLD_MINOR = 500
+WALL_THRESHOLD_MAIN = 50
+WALL_THRESHOLD_MINOR = 10
 
 SPOOF_DETECTION_THRESHOLD_PERCENT = 0.5
-SPOOF_QUANTITY_MIN = 200
+SPOOF_QUANTITY_MIN = 5
 
 STABILITY_TOLERANCE_PERCENT = 0.2
 
@@ -38,6 +39,10 @@ FUTURES_REST_URL = f'https://fapi.binance.com/fapi/v1/depth?symbol={PAIR}&limit=
 
 SPOT_WS_URL = f'wss://stream.binance.com:9443/ws/{PAIR.lower()}@depth'
 FUTURES_WS_URL = f'wss://fstream.binance.com/ws/{PAIR.lower()}@depth'
+
+# --- SET RECURSION LIMIT ---
+# HATI-HATI: Meningkatkan ini terlalu tinggi bisa menyebabkan crash stack overflow
+sys.setrecursionlimit(2000) # Default biasanya 1000, kita tingkatkan sedikit
 
 # --- FUNGSI PEMBANTU ---
 def get_price_step(price):
@@ -69,6 +74,7 @@ class OrderBookManager:
         self.snapshot_lock = asyncio.Lock()
         self.is_synced = False
         self._closing = False 
+        self._process_messages_running = False # Flag untuk status _process_messages
 
     async def _fetch_initial_snapshot(self):
         async with aiohttp.ClientSession() as session:
@@ -93,58 +99,83 @@ class OrderBookManager:
                 return False
 
     async def _handle_websocket_message(self, message):
+        # Tambahkan mekanisme backpressure jika queue terlalu penuh
+        if self.msg_queue.qsize() > 10000: # Batas ukuran queue
+            logging.warning(f"[{self.symbol}] Message queue penuh ({self.msg_queue.qsize()}), membuang pesan lama.")
+            try: # Coba buang beberapa pesan lama
+                for _ in range(self.msg_queue.qsize() // 2):
+                    self.msg_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
         await self.msg_queue.put(message)
 
     async def _process_messages(self):
-        while True:
-            try:
-                msg = await self.msg_queue.get()
-                data = json.loads(msg)
-                
-                final_update_id = data.get('u') or data.get('lastUpdateId')
-                first_update_id = data.get('U') or final_update_id
+        self._process_messages_running = True
+        try:
+            while not self._closing:
+                try:
+                    # Timeout singkat untuk menghindari blocking jika _closing menjadi True
+                    msg = await asyncio.wait_for(self.msg_queue.get(), timeout=1.0) 
+                    data = json.loads(msg)
+                    
+                    final_update_id = data.get('u') or data.get('lastUpdateId')
+                    first_update_id = data.get('U') or final_update_id
 
-                if not final_update_id:
-                    continue
-
-                async with self.snapshot_lock:
-                    if not self.is_synced:
-                        await asyncio.sleep(0.001)
+                    if not final_update_id:
                         continue
 
-                    if final_update_id <= self.last_update_id:
-                        continue
+                    async with self.snapshot_lock:
+                        if not self.is_synced:
+                            # Jika belum sinkron, mungkin masih menunggu snapshot awal atau sedang dalam re-sync oleh main loop
+                            # Biarkan pesan terkumpul di queue atau tunggu hingga sinkron
+                            await asyncio.sleep(0.001) 
+                            continue
 
-                    if first_update_id > self.last_update_id + 1 and self.last_update_id != -1: 
-                        logging.warning(f"[{self.symbol}] Out of sync or missed messages. Re-syncing orderbook. "
-                                        f"First WS ID: {first_update_id}, Last local ID: {self.last_update_id}")
-                        await self.stop() 
-                        continue 
+                        if final_update_id <= self.last_update_id:
+                            continue
 
-                    for price_str, qty_str in data['b']:
-                        price = float(price_str)
-                        qty = float(qty_str)
-                        if qty == 0:
-                            self.bids.pop(price, None)
-                        else:
-                            self.bids[price] = qty
+                        # Perubahan pada kondisi out of sync: Jangan panggil self.stop() langsung
+                        # Beri sinyal ke main loop agar bisa menangani restart secara terpusat
+                        if first_update_id > self.last_update_id + 1 and self.last_update_id != -1:
+                            logging.warning(f"[{self.symbol}] Out of sync or missed messages. "
+                                            f"First WS ID: {first_update_id}, Last local ID: {self.last_update_id}. Signaling for re-sync.")
+                            self.is_synced = False # Set unsynced, main loop akan melihat ini
+                            # Kosongkan queue untuk data yang sudah basi
+                            while not self.msg_queue.empty():
+                                try: self.msg_queue.get_nowait()
+                                except asyncio.QueueEmpty: break
+                            continue 
 
-                    for price_str, qty_str in data['a']:
-                        price = float(price_str)
-                        qty = float(qty_str)
-                        if qty == 0:
-                            self.asks.pop(price, None)
-                        else:
-                            self.asks[price] = qty
+                        for price_str, qty_str in data['b']:
+                            price = float(price_str)
+                            qty = float(qty_str)
+                            if qty == 0:
+                                self.bids.pop(price, None)
+                            else:
+                                self.bids[price] = qty
 
-                    self.last_update_id = final_update_id
-            except asyncio.CancelledError:
-                logging.info(f"[{self.symbol}] _process_messages task cancelled.")
-                break
-            except json.JSONDecodeError:
-                logging.error(f"[{self.symbol}] Gagal mendecode JSON dari pesan WebSocket: {msg[:200]}...")
-            except Exception as e:
-                logging.error(f"[{self.symbol}] Error saat memproses pesan WebSocket: {e}", exc_info=True)
+                        for price_str, qty_str in data['a']:
+                            price = float(price_str)
+                            qty = float(qty_str)
+                            if qty == 0:
+                                self.asks.pop(price, None)
+                            else:
+                                self.asks[price] = qty
+
+                        self.last_update_id = final_update_id
+                except asyncio.TimeoutError:
+                    # Timeout berarti tidak ada pesan masuk, cek _closing dan lanjutkan
+                    if self._closing: break
+                    continue 
+                except asyncio.CancelledError:
+                    logging.info(f"[{self.symbol}] _process_messages task cancelled.")
+                    break
+                except json.JSONDecodeError:
+                    logging.error(f"[{self.symbol}] Gagal mendecode JSON dari pesan WebSocket: {msg[:200]}...")
+                except Exception as e:
+                    logging.error(f"[{self.symbol}] Error saat memproses pesan WebSocket: {e}", exc_info=True)
+        finally:
+            self._process_messages_running = False
 
 
     async def _websocket_connect(self):
@@ -154,8 +185,14 @@ class OrderBookManager:
                 async with websockets.connect(self.ws_url, ping_interval=30, ping_timeout=10) as ws:
                     logging.info(f"[{self.symbol}] WebSocket terhubung.")
                     
+                    # Reset state sebelum fetch snapshot
                     self.last_update_id = -1
-                    self.is_synced = False
+                    self.is_synced = False # Akan diset True oleh _fetch_initial_snapshot
+
+                    # Kosongkan queue agar tidak memproses pesan lama saat reconnect
+                    while not self.msg_queue.empty():
+                        try: self.msg_queue.get_nowait()
+                        except asyncio.QueueEmpty: break
                     
                     if not await self._fetch_initial_snapshot():
                         logging.error(f"[{self.symbol}] Gagal ambil snapshot awal. Menutup WS dan coba lagi.")
@@ -164,15 +201,20 @@ class OrderBookManager:
                         continue
                     
                     logging.info(f"[{self.symbol}] WebSocket & REST snapshot sinkron. Mulai menerima pesan.")
-                    self.reconnect_delay = 1
+                    self.reconnect_delay = 1 # Reset delay setelah koneksi berhasil
 
-                    while not self._closing:
+                    while not self._closing and self.is_synced: # Tambahkan is_synced di sini
                         try:
-                            message = await asyncio.wait_for(ws.recv(), timeout=60)
+                            # Timeout lebih pendek untuk deteksi koneksi putus lebih cepat
+                            message = await asyncio.wait_for(ws.recv(), timeout=30) 
                             await self._handle_websocket_message(message)
                         except asyncio.TimeoutError:
-                            logging.warning(f"[{self.symbol}] WebSocket recv timeout, koneksi mungkin stagnan. Coba ping.")
-                            await ws.ping()
+                            logging.warning(f"[{self.symbol}] WebSocket recv timeout, koneksi mungkin stagnan. Memaksa ping.")
+                            try:
+                                await ws.ping()
+                            except websockets.exceptions.ConnectionClosed:
+                                logging.error(f"[{self.symbol}] Ping gagal, koneksi sudah terputus.")
+                                break
                         except websockets.exceptions.ConnectionClosedOK:
                             logging.info(f"[{self.symbol}] WebSocket connection closed normally.")
                             break
@@ -197,7 +239,13 @@ class OrderBookManager:
                 await asyncio.sleep(self.reconnect_delay)
                 self.reconnect_delay = min(self.reconnect_delay * 2, 60)
 
+    async def get_current_orderbook(self):
+        async with self.snapshot_lock:
+            # Mengembalikan salinan data untuk mencegah modifikasi saat iterasi
+            return dict(self.bids), dict(self.asks)
+
     async def start(self):
+        # Mencegah start jika sudah berjalan
         if self.ws_task and not self.ws_task.done():
             logging.info(f"[{self.symbol}] WS task already running, skipping start.")
             return
@@ -232,12 +280,14 @@ class OrderBookManager:
             self.processing_task = None
         
         if tasks_to_cancel:
+            # Menggunakan return_exceptions=True agar tidak crash jika ada task yang memang sudah crash
             await asyncio.gather(*tasks_to_cancel, return_exceptions=True) 
 
         self.bids = {}
         self.asks = {}
         self.last_update_id = -1
         self.is_synced = False
+        # Pastikan queue dikosongkan setelah semua task berhenti
         while not self.msg_queue.empty():
             try:
                 self.msg_queue.get_nowait()
@@ -251,8 +301,6 @@ class OrderBookManager:
 async def track_and_analyze_orderbook_websocket(orderbook_manager):
     logging.info(f"[INFO] Melacak orderbook WebSocket untuk {orderbook_manager.symbol} selama {TRACK_DURATION} detik...")
 
-    # Pastikan deque memiliki maxlen yang cukup atau 1 jika TRACK_INTERVAL 0 (walau 0 tidak disarankan)
-    # Gunakan maxlen=1 jika TRACK_DURATION <= TRACK_INTERVAL untuk hanya menyimpan snapshot terakhir
     effective_maxlen = max(1, int(TRACK_DURATION / TRACK_INTERVAL)) if TRACK_INTERVAL > 0 else 1
 
     orderbook_history = defaultdict(lambda: {'buy': deque(maxlen=effective_maxlen),
@@ -309,8 +357,7 @@ def analyze_full_orderbook(orderbook_history, snapshot_count, is_futures=False):
     sorted_prices = sorted(orderbook_history.keys())
 
     # Proses Bids (dari harga tertinggi ke terendah)
-    cumulative_buy_qty = 0
-    temp_buy_levels = [] # List sementara untuk menyimpan data sebelum sorting akhir
+    temp_buy_levels = [] 
     for price_step in sorted(sorted_prices, reverse=True): 
         buys = orderbook_history[price_step].get('buy', [])
         avg_qty = sum(buys) / len(buys) if buys else 0
@@ -337,8 +384,7 @@ def analyze_full_orderbook(orderbook_history, snapshot_count, is_futures=False):
             temp_buy_levels.append({'price': price_step, 'qty': avg_qty, 'label': label, 'is_wall_or_spoof': bool(label)})
             total_buy_qty_overall += avg_qty
     
-    # Hitung cumulative_qty setelah diurutkan dengan benar
-    temp_buy_levels.sort(key=lambda x: x['price'], reverse=True) # Pastikan diurutkan dari tertinggi ke terendah untuk beli
+    temp_buy_levels.sort(key=lambda x: x['price'], reverse=True)
     cumulative_buy_qty_current = 0
     for item in temp_buy_levels:
         cumulative_buy_qty_current += item['qty']
@@ -346,8 +392,7 @@ def analyze_full_orderbook(orderbook_history, snapshot_count, is_futures=False):
 
 
     # Proses Asks (dari harga terendah ke tertinggi)
-    cumulative_sell_qty = 0
-    temp_sell_levels = [] # List sementara
+    temp_sell_levels = []
     for price_step in sorted_prices:
         sells = orderbook_history[price_step].get('sell', [])
         avg_qty = sum(sells) / len(sells) if sells else 0
@@ -374,8 +419,7 @@ def analyze_full_orderbook(orderbook_history, snapshot_count, is_futures=False):
             temp_sell_levels.append({'price': price_step, 'qty': avg_qty, 'label': label, 'is_wall_or_spoof': bool(label)})
             total_sell_qty_overall += avg_qty
     
-    # Hitung cumulative_qty setelah diurutkan dengan benar
-    temp_sell_levels.sort(key=lambda x: x['price'], reverse=False) # Pastikan diurutkan dari terendah ke tertinggi untuk jual
+    temp_sell_levels.sort(key=lambda x: x['price'], reverse=False)
     cumulative_sell_qty_current = 0
     for item in temp_sell_levels:
         cumulative_sell_qty_current += item['qty']
@@ -450,7 +494,7 @@ def get_next_candle_close_time():
     else:
         next_candle_utc = now_utc.replace(minute=next_quarter_minute, second=0, microsecond=0)
     
-    return next_candle_utc # Mengembalikan waktu penutupan candle, bukan waktu pelacakan
+    return next_candle_utc 
 
 def wait_until_pre_close(next_candle_close_utc):
     pre_close_time_utc = next_candle_close_utc - timedelta(minutes=1)
@@ -465,32 +509,39 @@ def wait_until_pre_close(next_candle_close_utc):
         time.sleep(5)
 
 async def perform_analysis_and_send_report(spot_ob_manager, futures_ob_manager, report_time_utc, report_label):
-    wib_tz = timezone(timedelta(hours=7))
+    wib_tz = timezone(timedelta(hours=7)) # Pastikan WIB timezone didefinisikan di sini
     
     # Validasi OrderBookManager sebelum pelacakan
-    if not spot_ob_manager.is_synced:
-        logging.warning(f"[REPORT - {report_label}] Spot OrderBookManager belum sinkron. Mencoba memulai ulang...")
+    # Ubah menjadi loop retry yang lebih singkat
+    max_retries = 3
+    for attempt in range(max_retries):
+        if spot_ob_manager.is_synced and not spot_ob_manager._closing:
+            break
+        logging.warning(f"[REPORT - {report_label}] Spot OrderBookManager belum sinkron atau sedang menutup (Percobaan {attempt+1}/{max_retries}). Mencoba memulai ulang...")
         await spot_ob_manager.stop() 
-        await asyncio.sleep(2) 
+        await asyncio.sleep(3) # Jeda lebih lama
         await spot_ob_manager.start()
-        await asyncio.sleep(5) 
-        if not spot_ob_manager.is_synced: 
-            logging.error(f"[REPORT - {report_label}] Spot OrderBookManager gagal sinkron setelah restart. Tidak dapat membuat laporan.")
-            return # Keluar dari fungsi jika gagal sinkron
+        await asyncio.sleep(7) # Beri waktu lebih untuk sinkronisasi
+    else:
+        logging.error(f"[REPORT - {report_label}] Spot OrderBookManager gagal sinkron setelah {max_retries} percobaan. Tidak dapat membuat laporan.")
+        return 
 
-    if not futures_ob_manager.is_synced:
-        logging.warning(f"[REPORT - {report_label}] Futures OrderBookManager belum sinkron. Mencoba memulai ulang...")
+    for attempt in range(max_retries):
+        if futures_ob_manager.is_synced and not futures_ob_manager._closing:
+            break
+        logging.warning(f"[REPORT - {report_label}] Futures OrderBookManager belum sinkron atau sedang menutup (Percobaan {attempt+1}/{max_retries}). Mencoba memulai ulang...")
         await futures_ob_manager.stop() 
-        await asyncio.sleep(2) 
+        await asyncio.sleep(3) 
         await futures_ob_manager.start()
-        await asyncio.sleep(5) 
-        if not futures_ob_manager.is_synced: 
-            logging.error(f"[REPORT - {report_label}] Futures OrderBookManager gagal sinkron setelah restart. Tidak dapat membuat laporan.")
-            return # Keluar dari fungsi jika gagal sinkron
-
+        await asyncio.sleep(7) 
+    else:
+        logging.error(f"[REPORT - {report_label}] Futures OrderBookManager gagal sinkron setelah {max_retries} percobaan. Tidak dapat membuat laporan.")
+        return 
+    
+    # Pengecekan terakhir setelah percobaan
     if spot_ob_manager._closing or futures_ob_manager._closing:
-        logging.warning(f"[REPORT - {report_label}] Salah satu OrderBookManager sedang dalam proses penutupan. Melewatkan pembuatan laporan.")
-        return # Jangan buat laporan jika sedang menutup
+        logging.warning(f"[REPORT - {report_label}] Salah satu OrderBookManager sedang dalam proses penutupan setelah retry. Melewatkan pembuatan laporan.")
+        return 
 
     logging.info(f"[REPORT - {report_label}] Memulai pelacakan dan analisis untuk laporan.")
     
@@ -551,9 +602,6 @@ Pelacakan: {TRACK_DURATION} detik (sebelum penutupan), Real-time via WebSocket
 async def main():
     logging.info(f"=== {PAIR} ORDERBOOK WALL DETECTOR (SPOT + FUTURES) DIMULAI ===")
 
-    # Define WIB timezone globally or pass it
-    # wib_tz = timezone(timedelta(hours=7)) # Moved inside perform_analysis_and_send_report for encapsulation
-
     spot_ob_manager = OrderBookManager(PAIR + ' (Spot)', SPOT_REST_URL, SPOT_WS_URL)
     futures_ob_manager = OrderBookManager(PAIR + ' (Futures)', FUTURES_REST_URL, FUTURES_WS_URL, is_futures=True)
 
@@ -561,25 +609,27 @@ async def main():
     await futures_ob_manager.start()
 
     logging.info("Memberi waktu 10 detik agar WebSocket terhubung dan sync initial snapshot...")
-    await asyncio.sleep(10)
+    await asyncio.sleep(10) # Beri waktu lebih untuk sinkronisasi awal
 
     # --- Pengiriman Data Terbaru Sekarang ---
     logging.info("[MAIN] Melakukan pengiriman laporan awal dengan data terkini...")
-    await perform_analysis_and_send_report(spot_ob_manager, futures_ob_manager, datetime.utcnow(), "Laporan Awal (Data Terkini)")
+    # Gunakan datetime.now(wib_tz) untuk waktu lokal saat ini untuk laporan awal
+    wib_tz_for_now = timezone(timedelta(hours=7))
+    await perform_analysis_and_send_report(spot_ob_manager, futures_ob_manager, datetime.now(wib_tz_for_now), "Laporan Awal (Data Terkini)")
     logging.info("[MAIN] Laporan awal selesai dikirim. Melanjutkan ke siklus terjadwal.")
     # --- Akhir Pengiriman Data Terbaru Sekarang ---
 
     while True:
         try:
-            next_close_time_utc = get_next_candle_close_time() # Hitung waktu penutupan candle berikutnya
-            tracking_start_time_utc = wait_until_pre_close(next_close_time_utc) # Tunggu sampai 1 menit sebelumnya
-
+            next_close_time_utc = get_next_candle_close_time()
+            # Pastikan next_close_time_utc yang dikirim ke wait_until_pre_close adalah objek datetime yang benar.
+            await wait_until_pre_close(next_close_time_utc) # wait_until_pre_close akan mengembalikan next_close_time_utc lagi
+            
             await perform_analysis_and_send_report(spot_ob_manager, futures_ob_manager, next_close_time_utc, "Penutupan Lilin 15m")
             
             logging.info(f"[INFO] Siklus deteksi selesai. Menunggu siklus berikutnya...\n")
             
             now_after_send = datetime.utcnow()
-            # Hitung waktu untuk siklus berikutnya, agar tidak mengulang terlalu cepat jika ada delay
             next_tracking_start_utc = (next_close_time_utc + timedelta(minutes=15)) - timedelta(minutes=1)
             sleep_duration_seconds = (next_tracking_start_utc - now_after_send).total_seconds()
 
@@ -590,6 +640,25 @@ async def main():
                 logging.warning("[WARNING] Waktu tidur negatif atau nol. Tidur 60 detik sebagai fallback.")
                 await asyncio.sleep(60)
         
+        except RecursionError as re: # Tangkap RecursionError secara spesifik
+            logging.critical(f"[ERROR - Main Loop FATAL] RecursionError terdeteksi: {re}. Bot akan mencoba restart total.")
+            # Lakukan restart bersih untuk mencoba memulihkan dari RecursionError
+            try:
+                await spot_ob_manager.stop()
+                await futures_ob_manager.stop()
+                # Beri waktu lebih lama agar semua task benar-benar mati dan memori bersih
+                await asyncio.sleep(15) 
+                # Re-create manager objects untuk memastikan state bersih total
+                spot_ob_manager = OrderBookManager(PAIR + ' (Spot)', SPOT_REST_URL, SPOT_WS_URL)
+                futures_ob_manager = OrderBookManager(PAIR + ' (Futures)', FUTURES_REST_URL, FUTURES_WS_URL, is_futures=True)
+                await spot_ob_manager.start()
+                await futures_ob_manager.start()
+                await asyncio.sleep(15) # Waktu untuk sinkronisasi awal setelah restart total
+                logging.info("[MAIN] Bot berhasil restart setelah RecursionError.")
+            except Exception as restart_e:
+                logging.error(f"[ERROR - Main Loop Restart FATAL] Gagal me-restart bot setelah RecursionError: {restart_e}", exc_info=True)
+                logging.error("Bot mungkin perlu dihentikan dan dijalankan ulang secara manual.")
+                await asyncio.sleep(120) # Tunggu lebih lama sebelum mencoba lagi atau keluar
         except Exception as e:
             logging.error(f"[ERROR - Main Loop] Error tak terduga dalam siklus utama: {e}", exc_info=True)
             logging.info("Mencoba me-restart OrderBookManager untuk pemulihan...")
@@ -615,30 +684,24 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         logging.info("Bot dihentikan oleh pengguna. Melakukan cleanup...")
         async def cleanup_on_exit():
-            # Inisialisasi ulang manager hanya untuk tujuan cleanup jika mereka tidak ada
-            # Ini asumsi bot bisa dihentikan dari mana saja
-            # Untuk skenario nyata, mungkin perlu menyimpan referensi global atau passing arg
-            # Namun, untuk Ctrl+C, ini adalah pendekatan yang cukup aman.
-            spot_manager = OrderBookManager(PAIR + ' (Spot)', SPOT_REST_URL, SPOT_WS_URL)
-            futures_manager = OrderBookManager(PAIR + ' (Futures)', FUTURES_REST_URL, FUTURES_WS_URL, is_futures=True)
-            
-            # Gunakan referensi manager yang sebenarnya jika memungkinkan,
-            # contoh ini untuk kasus generic cleanup.
-            # Pada kasus ini, ini adalah cara yang lebih aman untuk memastikan stop() dipanggil.
-            await spot_manager.stop() 
-            await futures_manager.stop()
+            # Untuk cleanup saat KeyboardInterrupt, kita perlu mengakses manager yang sedang berjalan
+            # Jika objek manager tidak diakses secara global, ini akan sulit.
+            # Pendekatan yang lebih aman adalah dengan mengandalkan __del__ atau atexit,
+            # tetapi untuk kasus sederhana seperti ini, kita bisa membuat objek sementara
+            # asalkan tidak ada state kritis yang perlu ditransfer.
+            spot_temp_manager = OrderBookManager(PAIR + ' (Spot)', SPOT_REST_URL, SPOT_WS_URL)
+            futures_temp_manager = OrderBookManager(PAIR + ' (Futures)', FUTURES_REST_URL, FUTURES_WS_URL, is_futures=True)
+            await spot_temp_manager.stop()
+            await futures_temp_manager.stop()
         
         try:
             loop = asyncio.get_running_loop()
             if loop.is_running():
-                # Jadwalkan cleanup sebagai task di loop yang sedang berjalan
                 loop.create_task(cleanup_on_exit())
-                # Tunggu sebentar agar task punya kesempatan berjalan
                 loop.run_until_complete(asyncio.sleep(1)) 
             else:
-                # Jika tidak ada loop berjalan, jalankan cleanup dalam loop baru
                 asyncio.run(cleanup_on_exit())
-        except RuntimeError: # No running event loop
+        except RuntimeError: 
             asyncio.run(cleanup_on_exit())
 
     except Exception as e:
