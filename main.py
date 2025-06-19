@@ -5,6 +5,7 @@ import asyncio
 import aiohttp
 import websockets
 import logging
+import numpy as np  # Tambahkan import numpy
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 import math
@@ -12,18 +13,21 @@ import sys
 
 # --- KONFIGURASI ---
 PAIR = 'BTCUSDT'
-STEP = 100
+STEP = 100 # Tetap 100 sesuai yang Anda inginkan
 DEPTH = 1000
 
-WALL_THRESHOLD_MAIN = 500
-WALL_THRESHOLD_MINOR = 200
+# !!! PENTING: NILAI-NILAI INI PERLU DISESUAIKAN KARENA SEKARANG ADALAH TOTAL QTY DALAM STEP !!!
+# Anda harus mengamati output pertama kali setelah perubahan ini
+# dan sesuaikan kembali nilai-nilai ini agar sesuai dengan yang Anda anggap "Wall" atau "Spoof"
+WALL_THRESHOLD_MAIN = 200   # Contoh: mungkin 50 BTC total dalam 100 poin harga adalah "Main Wall"
+WALL_THRESHOLD_MINOR = 100  # Contoh: mungkin 20 BTC total dalam 100 poin harga adalah "Minor Wall"
 
 SPOOF_DETECTION_THRESHOLD_PERCENT = 0.5
-SPOOF_QUANTITY_MIN = 5
+SPOOF_QUANTITY_MIN = 100    # Contoh: hanya cek spoofing untuk total kuantitas step >= 10 BTC
 
 STABILITY_TOLERANCE_PERCENT = 0.2
 
-MAX_DISPLAY_LINES = 5
+MAX_DISPLAY_LINES = 15 # Ditingkatkan agar bisa melihat lebih banyak 'wall'
 
 TRACK_INTERVAL = 3
 TRACK_DURATION = 60
@@ -47,14 +51,19 @@ sys.setrecursionlimit(2000)
 def get_price_step(price):
     return math.floor(float(price) / STEP) * STEP
 
-def _get_label_from_analysis(avg_qty, is_stable, is_spoof):
-    if is_spoof:
-        return '⚠️ SPOOFING?'
+# Mengubah fungsi untuk menerima 'side' sebagai parameter
+def _get_label_from_analysis(avg_qty, is_stable, is_spoof, side):
+    label = ""
+    
+    # Prioritaskan label SPOOFING jika terdeteksi
+    if is_spoof and avg_qty >= SPOOF_QUANTITY_MIN: # Pastikan kuantitas juga memenuhi SPOOF_QUANTITY_MIN
+        label = '⚠️ SPOOFING?'
     elif avg_qty >= WALL_THRESHOLD_MAIN:
-        return '🟥🟥🟥 WALL' if is_stable else '⚠️ Fake Wall'
+        label = '🟥🟥🟥 WALL' if is_stable else '⚠️ Fake Wall'
     elif avg_qty >= WALL_THRESHOLD_MINOR:
-        return '(Minor Wall)' if is_stable else '(Minor Fake Wall)'
-    return ''
+        label = '(Minor Wall)' if is_stable else '(Minor Fake Wall)'
+    
+    return label
 
 # --- KELAS ORDERBOOK MANAGER (WebSocket) ---
 class OrderBookManager:
@@ -64,8 +73,10 @@ class OrderBookManager:
         self.ws_url = ws_url
         self.session = session # Re-use aiohttp session
         self.is_futures = is_futures
-        self.bids = {}
-        self.asks = {}
+        # Mengubah struktur bids/asks untuk menyimpan order individual di setiap step
+        # Format: {price_step: {order_price: qty, order_price: qty, ...}}
+        self.bids_by_step = defaultdict(dict)
+        self.asks_by_step = defaultdict(dict)
         self.last_update_id = -1
         self.msg_queue = asyncio.Queue()
         self.processing_task = None
@@ -83,13 +94,27 @@ class OrderBookManager:
             async with self.session.get(self.rest_url, timeout=10) as resp:
                 resp.raise_for_status()
                 data = await resp.json()
-                self.bids = {float(price): float(qty) for price, qty in data['bids']}
-                self.asks = {float(price): float(qty) for price, qty in data['asks']}
+                
+                # Menginisialisasi bids_by_step dan asks_by_step dari snapshot
+                self.bids_by_step.clear()
+                self.asks_by_step.clear()
+
+                for price_str, qty_str in data['bids']:
+                    price = float(price_str)
+                    qty = float(qty_str)
+                    price_step = get_price_step(price)
+                    self.bids_by_step[price_step][price] = qty # Simpan harga asli di dalam step
+
+                for price_str, qty_str in data['asks']:
+                    price = float(price_str)
+                    qty = float(qty_str)
+                    price_step = get_price_step(price)
+                    self.asks_by_step[price_step][price] = qty # Simpan harga asli di dalam step
+                    
                 self.last_update_id = data['lastUpdateId']
-                logging.info(f"[{self.symbol}] Snapshot REST berhasil diambil. lastUpdateId: {self.last_update_id}. Jumlah bids: {len(self.bids)}, asks: {len(self.asks)}")
+                logging.info(f"[{self.symbol}] Snapshot REST berhasil diambil. lastUpdateId: {self.last_update_id}. Jumlah bids_by_step: {len(self.bids_by_step)}, asks_by_step: {len(self.asks_by_step)}")
                 self.is_synced = True
-                # Set grace period to last for a few seconds after sync
-                self.initial_sync_grace_period_end_time = time.time() + 5 # 5 seconds grace period
+                self.initial_sync_grace_period_end_time = time.time() + 5 
                 return True
         except aiohttp.ClientError as e:
             logging.error(f"[{self.symbol}] Gagal mengambil snapshot REST: {e}")
@@ -132,11 +157,8 @@ class OrderBookManager:
                         if final_update_id <= self.last_update_id:
                             continue
 
-                        # Pengecekan Out of Sync
-                        # Check if we are within the grace period
                         if time.time() < self.initial_sync_grace_period_end_time:
-                            # Skip strict ID check during grace period, just process the update
-                            pass # Process update below
+                            pass 
                         elif first_update_id > self.last_update_id + 1 and self.last_update_id != -1:
                             logging.warning(f"[{self.symbol}] Out of sync or missed messages. "
                                             f"First WS ID: {first_update_id}, Last local ID: {self.last_update_id}. Signaling for re-sync.")
@@ -146,27 +168,31 @@ class OrderBookManager:
                                 except asyncio.QueueEmpty: break
                             continue 
 
-                        # Update orderbook
+                        # Update orderbook by price step
                         for price_str, qty_str in data['b']:
                             price = float(price_str)
                             qty = float(qty_str)
+                            price_step = get_price_step(price)
                             if qty == 0:
-                                self.bids.pop(price, None)
+                                self.bids_by_step[price_step].pop(price, None)
+                                if not self.bids_by_step[price_step]: # Hapus step jika kosong
+                                    self.bids_by_step.pop(price_step, None)
                             else:
-                                self.bids[price] = qty
+                                self.bids_by_step[price_step][price] = qty
 
                         for price_str, qty_str in data['a']:
                             price = float(price_str)
                             qty = float(qty_str)
+                            price_step = get_price_step(price)
                             if qty == 0:
-                                self.asks.pop(price, None)
+                                self.asks_by_step[price_step].pop(price, None)
+                                if not self.asks_by_step[price_step]: # Hapus step jika kosong
+                                    self.asks_by_step.pop(price_step, None)
                             else:
-                                self.asks[price] = qty
+                                self.asks_by_step[price_step][price] = qty
 
                         self.last_update_id = final_update_id
-                        # Extend grace period if updates are coming in fast and smoothly
-                        # This avoids the "too early" out of sync if there's a continuous stream of large jumps
-                        self.initial_sync_grace_period_end_time = time.time() + 1 # Extend by 1 second for each successful update during initial phase
+                        self.initial_sync_grace_period_end_time = time.time() + 1 
 
                 except asyncio.TimeoutError:
                     if self._closing: break
@@ -190,7 +216,7 @@ class OrderBookManager:
                     
                     self.last_update_id = -1
                     self.is_synced = False 
-                    self.initial_sync_grace_period_end_time = 0 # Reset grace period
+                    self.initial_sync_grace_period_end_time = 0 
 
                     while not self.msg_queue.empty():
                         try: self.msg_queue.get_nowait()
@@ -242,7 +268,10 @@ class OrderBookManager:
 
     async def get_current_orderbook(self):
         async with self.snapshot_lock:
-            return dict(self.bids), dict(self.asks)
+            # Mengembalikan salinan deep dari defaultdict agar tidak ada modifikasi eksternal
+            current_bids = {price_step: dict(orders) for price_step, orders in self.bids_by_step.items()}
+            current_asks = {price_step: dict(orders) for price_step, orders in self.asks_by_step.items()}
+            return current_bids, current_asks
 
     async def start(self):
         if self.ws_task and not self.ws_task.done():
@@ -280,11 +309,11 @@ class OrderBookManager:
         if tasks_to_cancel:
             await asyncio.gather(*tasks_to_cancel, return_exceptions=True) 
 
-        self.bids = {}
-        self.asks = {}
+        self.bids_by_step.clear()
+        self.asks_by_step.clear()
         self.last_update_id = -1
         self.is_synced = False
-        self.initial_sync_grace_period_end_time = 0 # Reset grace period on stop
+        self.initial_sync_grace_period_end_time = 0 
         while not self.msg_queue.empty():
             try:
                 self.msg_queue.get_nowait()
@@ -300,6 +329,7 @@ async def track_and_analyze_orderbook_websocket(orderbook_manager):
 
     effective_maxlen = max(1, int(TRACK_DURATION / TRACK_INTERVAL)) if TRACK_INTERVAL > 0 else 1
 
+    # Mengubah struktur orderbook_history untuk menyimpan total_qty_in_step per snapshot
     orderbook_history = defaultdict(lambda: {'buy': deque(maxlen=effective_maxlen),
                                              'sell': deque(maxlen=effective_maxlen)})
     end_time = time.time() + TRACK_DURATION
@@ -311,22 +341,25 @@ async def track_and_analyze_orderbook_websocket(orderbook_manager):
             await asyncio.sleep(TRACK_INTERVAL)
             continue
             
-        current_bids, current_asks = await orderbook_manager.get_current_orderbook()
+        current_bids_by_step, current_asks_by_step = await orderbook_manager.get_current_orderbook()
         
-        if not current_bids and not current_asks:
+        if not current_bids_by_step and not current_asks_by_step:
             logging.warning(f"[{orderbook_manager.symbol}] Tidak ada data orderbook dari manager pada snapshot ini. Melanjutkan...")
             await asyncio.sleep(TRACK_INTERVAL)
             continue
         
         snapshot_count += 1
 
-        for bid_price, bid_qty in current_bids.items():
-            price_step = get_price_step(bid_price)
-            orderbook_history[price_step]['buy'].append(bid_qty)
-
-        for ask_price, ask_qty in current_asks.items():
-            price_step = get_price_step(ask_price)
-            orderbook_history[price_step]['sell'].append(ask_qty)
+        # Kumpulkan total kuantitas untuk setiap price_step di snapshot ini
+        for price_step, orders_in_step in current_bids_by_step.items():
+            if orders_in_step:
+                total_qty_in_this_step = sum(orders_in_step.values())
+                orderbook_history[price_step]['buy'].append(total_qty_in_this_step)
+        
+        for price_step, orders_in_step in current_asks_by_step.items():
+            if orders_in_step:
+                total_qty_in_this_step = sum(orders_in_step.values())
+                orderbook_history[price_step]['sell'].append(total_qty_in_this_step)
         
         await asyncio.sleep(TRACK_INTERVAL)
     
@@ -351,35 +384,40 @@ def analyze_full_orderbook(orderbook_history, snapshot_count, is_futures=False):
         logging.warning("[ANALYSIS] orderbook_history kosong, tidak ada analisis yang dilakukan.")
         return [], [], "BALANCED (No data to analyze)"
 
-    sorted_prices = sorted(orderbook_history.keys())
+    all_price_steps = sorted(orderbook_history.keys())
 
+    # Analisis BUY ORDERS
     temp_buy_levels = [] 
-    for price_step in sorted(sorted_prices, reverse=True): 
-        buys = orderbook_history[price_step].get('buy', [])
-        avg_qty = sum(buys) / len(buys) if buys else 0
+    for price_step in sorted(all_price_steps, reverse=True): # Urutkan dari harga tertinggi ke terendah untuk BUY
+        history_of_total_buys_in_step = orderbook_history[price_step].get('buy', [])
+        
+        avg_qty = np.mean(history_of_total_buys_in_step) if history_of_total_buys_in_step else 0
             
         is_stable = True
         is_spoof = False
 
-        if len(buys) >= 1: 
-            if len(buys) >= 2:
-                is_stable = all(abs(q - avg_qty) < avg_qty * STABILITY_TOLERANCE_PERCENT for q in buys)
+        if len(history_of_total_buys_in_step) >= 1: 
+            if len(history_of_total_buys_in_step) >= 2:
+                # Cek stabilitas berdasarkan fluktuasi total kuantitas
+                min_qty_in_history = np.min(history_of_total_buys_in_step)
+                max_qty_in_history = np.max(history_of_total_buys_in_step)
+                if avg_qty > 0 and (max_qty_in_history - min_qty_in_history) / avg_qty > STABILITY_TOLERANCE_PERCENT:
+                    is_stable = False
             else: 
-                is_stable = True 
+                is_stable = True # Tidak bisa cek stabilitas dengan hanya 1 data
 
-            if avg_qty >= SPOOF_QUANTITY_MIN and len(buys) >= 2:
-                min_qty = min(buys)
-                max_qty = max(buys)
-                if avg_qty > 0 and (max_qty - min_qty) / avg_qty > SPOOF_DETECTION_THRESHOLD_PERCENT:
-                    is_spoof = True
-                elif all(q < SPOOF_QUANTITY_MIN * 0.1 for q in list(buys)[:-1]) and list(buys)[-1] >= SPOOF_QUANTITY_MIN:
-                    is_spoof = True
+            # Logika spoofing (berbasis total kuantitas per step)
+            if avg_qty >= SPOOF_QUANTITY_MIN and not is_stable:
+                # Jika total kuantitas step cukup besar dan tidak stabil, bisa jadi indikasi spoofing.
+                # Ini adalah interpretasi yang berbeda dari spoofing tradisional (muncul/hilang order besar).
+                is_spoof = True
         
         if avg_qty > 0:
-            label = _get_label_from_analysis(avg_qty, is_stable, is_spoof)
+            label = _get_label_from_analysis(avg_qty, is_stable, is_spoof, 'buy') # Meneruskan 'buy'
             temp_buy_levels.append({'price': price_step, 'qty': avg_qty, 'label': label, 'is_wall_or_spoof': bool(label)})
             total_buy_qty_overall += avg_qty
     
+    # Sortir dan hitung kumulatif
     temp_buy_levels.sort(key=lambda x: x['price'], reverse=True)
     cumulative_buy_qty_current = 0
     for item in temp_buy_levels:
@@ -387,33 +425,34 @@ def analyze_full_orderbook(orderbook_history, snapshot_count, is_futures=False):
         analyzed_buy_levels.append({**item, 'cumulative_qty': cumulative_buy_qty_current})
 
 
+    # Analisis SELL ORDERS
     temp_sell_levels = []
-    for price_step in sorted_prices:
-        sells = orderbook_history[price_step].get('sell', [])
-        avg_qty = sum(sells) / len(sells) if sells else 0
+    for price_step in sorted(all_price_steps, reverse=False): # Urutkan dari harga terendah ke tertinggi untuk SELL
+        history_of_total_sells_in_step = orderbook_history[price_step].get('sell', [])
+        
+        avg_qty = np.mean(history_of_total_sells_in_step) if history_of_total_sells_in_step else 0
 
         is_stable = True
         is_spoof = False
 
-        if len(sells) >= 1:
-            if len(sells) >= 2:
-                is_stable = all(abs(q - avg_qty) < avg_qty * STABILITY_TOLERANCE_PERCENT for q in sells)
+        if len(history_of_total_sells_in_step) >= 1:
+            if len(history_of_total_sells_in_step) >= 2:
+                min_qty_in_history = np.min(history_of_total_sells_in_step)
+                max_qty_in_history = np.max(history_of_total_sells_in_step)
+                if avg_qty > 0 and (max_qty_in_history - min_qty_in_history) / avg_qty > STABILITY_TOLERANCE_PERCENT:
+                    is_stable = False
             else:
                 is_stable = True
 
-            if avg_qty >= SPOOF_QUANTITY_MIN and len(sells) >= 2:
-                min_qty = min(sells)
-                max_qty = max(sells)
-                if avg_qty > 0 and (max_qty - min_qty) / avg_qty > SPOOF_DETECTION_THRESHOLD_PERCENT:
-                    is_spoof = True
-                elif all(q < SPOOF_QUANTITY_MIN * 0.1 for q in list(sells)[:-1]) and list(sells)[-1] >= SPOOF_QUANTITY_MIN:
-                    is_spoof = True
+            if avg_qty >= SPOOF_QUANTITY_MIN and not is_stable:
+                is_spoof = True
         
         if avg_qty > 0:
-            label = _get_label_from_analysis(avg_qty, is_stable, is_spoof)
+            label = _get_label_from_analysis(avg_qty, is_stable, is_spoof, 'sell') # Meneruskan 'sell'
             temp_sell_levels.append({'price': price_step, 'qty': avg_qty, 'label': label, 'is_wall_or_spoof': bool(label)})
             total_sell_qty_overall += avg_qty
     
+    # Sortir dan hitung kumulatif
     temp_sell_levels.sort(key=lambda x: x['price'], reverse=False)
     cumulative_sell_qty_current = 0
     for item in temp_sell_levels:
@@ -428,18 +467,22 @@ def analyze_full_orderbook(orderbook_history, snapshot_count, is_futures=False):
     if total_relevant_buy_qty > 0 or total_relevant_sell_qty > 0:
         imbalance_detail = f" (Total Buy Wall/Spoof: {total_relevant_buy_qty:,.2f} BTC vs Total Sell Wall/Spoof: {total_relevant_sell_qty:,.2f} BTC)"
 
-    if total_buy_qty_overall > 0 and total_sell_qty_overall > 0:
-        if total_buy_qty_overall / total_sell_qty_overall >= 1.2:
+    # Logika Imbalance ini berdasarkan 'Total Buy Wall/Spoof' dan 'Total Sell Wall/Spoof'
+    # Bukan berdasarkan total_buy_qty_overall dan total_sell_qty_overall yang mencakup semua qty
+    # Jika Anda ingin imbalance mencakup semua qty, ganti variabelnya.
+    if total_relevant_buy_qty > 0 and total_relevant_sell_qty > 0:
+        if total_relevant_buy_qty / total_relevant_sell_qty >= 1.2:
             imbalance = 'BUY DOMINANT'
-        elif total_sell_qty_overall / total_buy_qty_overall >= 1.2:
+        elif total_relevant_sell_qty / total_relevant_buy_qty >= 1.2:
             imbalance = 'SELL DOMINANT'
-    elif total_buy_qty_overall > 0:
-        imbalance = 'BUY DOMINANT (No significant sell volume)'
-    elif total_sell_qty_overall > 0:
-        imbalance = 'SELL DOMINANT (No significant buy volume)'
+    elif total_relevant_buy_qty > 0:
+        imbalance = 'BUY DOMINANT (No significant sell wall/spoof)'
+    elif total_relevant_sell_qty > 0:
+        imbalance = 'SELL DOMINANT (No significant buy wall/spoof)'
     else:
-        imbalance = 'BALANCED (No significant orderbook activity detected)'
+        imbalance = 'BALANCED (No significant wall/spoof activity detected)'
     
+    # Menambahkan detail Imbalance (total_relevant_buy_qty vs total_relevant_sell_qty)
     imbalance += imbalance_detail
 
     return analyzed_buy_levels, analyzed_sell_levels, imbalance
@@ -450,9 +493,23 @@ def format_full_orderbook_output(levels, max_lines, side):
 
     output_lines = ["Price → Individual Qty | Cumulative Qty | Label"]
     
-    for item in levels[:max_lines]:
-        label_text = f" {item['label']}" if item['label'] else ""
-        output_lines.append(f"{item['price']:,.0f} → {item['qty']:,.2f} BTC | {item['cumulative_qty']:,.2f} BTC{label_text}")
+    # Urutkan level sebelum menampilkan agar konsisten dengan tampilan Discord
+    if side == 'buy':
+        display_levels = sorted(levels, key=lambda x: x['price'], reverse=True)
+    else: # side == 'sell'
+        display_levels = sorted(levels, key=lambda x: x['price'], reverse=False)
+
+    display_count = 0
+    for item in display_levels:
+        if item['qty'] > 0: # Hanya tampilkan jika kuantitas > 0
+            label_text = f" {item['label']}" if item['label'] else ""
+            output_lines.append(f"{item['price']:,.0f} → {item['qty']:,.2f} BTC | {item['cumulative_qty']:,.2f} BTC{label_text}")
+            display_count += 1
+            if display_count >= max_lines: # Batasi jumlah baris yang ditampilkan
+                break
+
+    if display_count == 0 and len(output_lines) == 1:
+        return f"Tidak ada data { 'beli' if side == 'buy' else 'jual' } orderbook yang cukup signifikan untuk ditampilkan."
 
     return "\n".join(output_lines)
 
@@ -534,12 +591,14 @@ async def perform_analysis_and_send_report(spot_ob_manager, futures_ob_manager, 
         logging.warning(f"[REPORT - {report_label}] Tidak ada data riwayat spot yang terkumpul atau snapshot kosong. Melewatkan analisis spot.")
         spot_buy, spot_sell, spot_imbalance = [], [], "BALANCED (No data collected)"
     else:
-        spot_buy, spot_sell, spot_imbalance = analyze_full_orderbook(spot_history, spot_snapshot_count)
+        # Menambahkan parameter is_futures di sini
+        spot_buy, spot_sell, spot_imbalance = analyze_full_orderbook(spot_history, spot_snapshot_count, is_futures=False)
     
     if not futures_history or futures_snapshot_count == 0:
         logging.warning(f"[REPORT - {report_label}] Tidak ada data riwayat futures yang terkumpul atau snapshot kosong. Melewatkan analisis futures.")
         futures_buy, futures_sell, futures_imbalance = [], [], "BALANCED (No data collected)"
     else:
+        # Menambahkan parameter is_futures di sini
         futures_buy, futures_sell, futures_imbalance = analyze_full_orderbook(futures_history, futures_snapshot_count, is_futures=True)
 
     report_time_wib = report_time_utc.astimezone(wib_tz)
@@ -584,7 +643,6 @@ Pelacakan: {TRACK_DURATION} detik (sebelum penutupan), Real-time via WebSocket
 async def main():
     logging.info(f"=== {PAIR} ORDERBOOK WALL DETECTOR (SPOT + FUTURES) DIMULAI ===")
 
-    # Create a single aiohttp session for all REST calls
     global aiohttp_session
     aiohttp_session = aiohttp.ClientSession()
 
@@ -606,17 +664,20 @@ async def main():
     while True:
         try:
             for name, manager in {'Spot': spot_ob_manager, 'Futures': futures_ob_manager}.items():
-                if not manager.is_synced:
+                # Pastikan manager saat ini yang digunakan, bukan global variable yang mungkin di-reassign
+                current_manager = spot_ob_manager if name == 'Spot' else futures_ob_manager
+                if not current_manager.is_synced:
                     logging.warning(f"[MAIN LOOP] {name} OrderBookManager terdeteksi UNSYNCED. Memaksa restart penuh...")
-                    await manager.stop()
+                    await current_manager.stop()
                     # Re-create the manager object to ensure a clean state
                     if name == 'Spot':
                         spot_ob_manager = OrderBookManager(PAIR + ' (Spot)', SPOT_REST_URL, SPOT_WS_URL, aiohttp_session)
                     else: # Futures
                         futures_ob_manager = OrderBookManager(PAIR + ' (Futures)', FUTURES_REST_URL, FUTURES_WS_URL, aiohttp_session, is_futures=True)
-                    await manager.start() # Start the newly created/updated manager
+                    await (spot_ob_manager if name == 'Spot' else futures_ob_manager).start() # Start the newly created/updated manager
                     await asyncio.sleep(10) 
-                    if not manager.is_synced: 
+                    # Re-check sync status after restart
+                    if not (spot_ob_manager if name == 'Spot' else futures_ob_manager).is_synced: 
                         logging.error(f"[MAIN LOOP] {name} OrderBookManager GAGAL sinkron setelah restart penuh. Akan mencoba lagi di siklus berikutnya.")
                         continue 
 
@@ -643,10 +704,10 @@ async def main():
             try:
                 if aiohttp_session and not aiohttp_session.closed:
                     await aiohttp_session.close()
-                await spot_ob_manager.stop()
-                await futures_ob_manager.stop()
+                if spot_ob_manager: await spot_ob_manager.stop()
+                if futures_ob_manager: await futures_ob_manager.stop()
                 await asyncio.sleep(15) 
-                # Re-create session and managers for a truly clean restart
+                
                 aiohttp_session = aiohttp.ClientSession()
                 spot_ob_manager = OrderBookManager(PAIR + ' (Spot)', SPOT_REST_URL, SPOT_WS_URL, aiohttp_session)
                 futures_ob_manager = OrderBookManager(PAIR + ' (Futures)', FUTURES_REST_URL, FUTURES_WS_URL, aiohttp_session, is_futures=True)
@@ -663,11 +724,10 @@ async def main():
             logging.info("Mencoba me-restart OrderBookManager untuk pemulihan...")
             
             try:
-                # Reuse existing session, but stop/start managers
-                await spot_ob_manager.stop()
-                await futures_ob_manager.stop()
+                if spot_ob_manager: await spot_ob_manager.stop()
+                if futures_ob_manager: await futures_ob_manager.stop()
                 await asyncio.sleep(5)
-                # Re-create managers, passing the existing session
+                
                 spot_ob_manager = OrderBookManager(PAIR + ' (Spot)', SPOT_REST_URL, SPOT_WS_URL, aiohttp_session)
                 futures_ob_manager = OrderBookManager(PAIR + ' (Futures)', FUTURES_REST_URL, FUTURES_WS_URL, aiohttp_session, is_futures=True)
                 await spot_ob_manager.start()
@@ -680,7 +740,7 @@ async def main():
 # Global references for cleanup_on_exit
 spot_ob_manager = None
 futures_ob_manager = None
-aiohttp_session = None # Global for the session as well
+aiohttp_session = None 
 
 if __name__ == '__main__':
     if DISCORD_WEBHOOK_URL == 'https://discord.com/api/webhooks/YOUR_DISCORD_WEBHOOK_URL_HERE':
@@ -693,7 +753,7 @@ if __name__ == '__main__':
         if futures_ob_manager:
             await futures_ob_manager.stop()
         if aiohttp_session and not aiohttp_session.closed:
-            await aiohttp_session.close() # Close the shared session
+            await aiohttp_session.close() 
         logging.info("Global managers and aiohttp session cleanup completed.")
 
     try:
@@ -703,12 +763,13 @@ if __name__ == '__main__':
         try:
             loop = asyncio.get_running_loop()
             if loop.is_running():
+                # Schedule the cleanup task and wait for it to complete or for a short duration
                 loop.create_task(cleanup_on_exit_global())
-                loop.run_until_complete(asyncio.sleep(1)) 
+                loop.run_until_complete(asyncio.sleep(3)) # Give some time for cleanup to run
             else:
                 asyncio.run(cleanup_on_exit_global())
         except RuntimeError: 
-             asyncio.run(cleanup_on_exit_global())
+             asyncio.run(cleanup_on_exit_global()) # Fallback for already closed loop
         except Exception as cleanup_e:
             logging.error(f"Error during cleanup_on_exit: {cleanup_e}", exc_info=True)
 
