@@ -27,7 +27,7 @@ SPOOF_QUANTITY_MIN = 50 # Kuantitas minimum agar order bisa dianggap "spoofable"
 STABILITY_TOLERANCE_PERCENT = 0.2 # Toleransi 20% perubahan kuantitas agar dianggap stabil
 
 # Jumlah baris orderbook yang akan ditampilkan di Discord (termasuk non-wall)
-MAX_DISPLAY_LINES = 15 # Contoh: tampilkan 15 baris terdekat dari harga saat ini (per sisi)
+MAX_DISPLAY_LINES = 30 # Contoh: tampilkan 15 baris terdekat dari harga saat ini (per sisi)
 
 TRACK_INTERVAL = 3  # detik, interval pengambilan snapshot orderbook selama durasi pelacakan
 TRACK_DURATION = 60 # detik, total durasi pelacakan sebelum penutupan candle 15m
