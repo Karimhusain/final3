@@ -27,7 +27,7 @@ SPOOF_QUANTITY_MIN = 100    # Contoh: hanya cek spoofing untuk total kuantitas s
 
 STABILITY_TOLERANCE_PERCENT = 0.2
 
-MAX_DISPLAY_LINES = 15 # Ditingkatkan agar bisa melihat lebih banyak 'wall'
+MAX_DISPLAY_LINES = 5 # Ditingkatkan agar bisa melihat lebih banyak 'wall'
 
 TRACK_INTERVAL = 3
 TRACK_DURATION = 60
