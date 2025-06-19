@@ -12,7 +12,7 @@ import logging # Untuk logging yang lebih baik
 # Perhatian: Ganti URL Discord Webhook dengan milik Anda!
 PAIR = 'BTCUSDT'
 STEP = 100
-DEPTH = 200 # Maksimal 1000 di Binance
+DEPTH = 100 # Maksimal 1000 di Binance
 WALL_THRESHOLD_MAIN = 1000 # Contoh: 1000 BTC dianggap "WALL" utama
 WALL_THRESHOLD_MINOR = 100 # Contoh: 100 BTC dianggap "wall" minor/potensial
 MAX_BUY_LINES = 10
