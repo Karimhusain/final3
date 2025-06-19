@@ -58,10 +58,11 @@ def _get_label_from_analysis(avg_qty, is_stable, is_spoof):
 
 # --- KELAS ORDERBOOK MANAGER (WebSocket) ---
 class OrderBookManager:
-    def __init__(self, symbol, rest_url, ws_url, is_futures=False):
+    def __init__(self, symbol, rest_url, ws_url, session, is_futures=False):
         self.symbol = symbol
         self.rest_url = rest_url
         self.ws_url = ws_url
+        self.session = session # Re-use aiohttp session
         self.is_futures = is_futures
         self.bids = {}
         self.asks = {}
@@ -74,36 +75,35 @@ class OrderBookManager:
         self.is_synced = False
         self._closing = False 
         self._process_messages_running = False 
-        self.initial_sync_grace_period = True # Flag untuk grace period sinkronisasi awal
+        self.initial_sync_grace_period_end_time = 0 # Timestamp for grace period
 
     async def _fetch_initial_snapshot(self):
-        async with aiohttp.ClientSession() as session:
-            try:
-                logging.info(f"[{self.symbol}] Mengambil snapshot REST awal...")
-                async with session.get(self.rest_url, timeout=10) as resp:
-                    resp.raise_for_status()
-                    data = await resp.json()
-                    self.bids = {float(price): float(qty) for price, qty in data['bids']}
-                    self.asks = {float(price): float(qty) for price, qty in data['asks']}
-                    self.last_update_id = data['lastUpdateId']
-                    logging.info(f"[{self.symbol}] Snapshot REST berhasil diambil. lastUpdateId: {self.last_update_id}. Jumlah bids: {len(self.bids)}, asks: {len(self.asks)}")
-                    self.is_synced = True
-                    self.initial_sync_grace_period = True # Set grace period
-                    return True
-            except aiohttp.ClientError as e:
-                logging.error(f"[{self.symbol}] Gagal mengambil snapshot REST: {e}")
-                self.is_synced = False
-                return False
-            except Exception as e:
-                logging.error(f"[{self.symbol}] Error saat mengambil snapshot REST: {e}", exc_info=True)
-                self.is_synced = False
-                return False
+        try:
+            logging.info(f"[{self.symbol}] Mengambil snapshot REST awal...")
+            async with self.session.get(self.rest_url, timeout=10) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+                self.bids = {float(price): float(qty) for price, qty in data['bids']}
+                self.asks = {float(price): float(qty) for price, qty in data['asks']}
+                self.last_update_id = data['lastUpdateId']
+                logging.info(f"[{self.symbol}] Snapshot REST berhasil diambil. lastUpdateId: {self.last_update_id}. Jumlah bids: {len(self.bids)}, asks: {len(self.asks)}")
+                self.is_synced = True
+                # Set grace period to last for a few seconds after sync
+                self.initial_sync_grace_period_end_time = time.time() + 5 # 5 seconds grace period
+                return True
+        except aiohttp.ClientError as e:
+            logging.error(f"[{self.symbol}] Gagal mengambil snapshot REST: {e}")
+            self.is_synced = False
+            return False
+        except Exception as e:
+            logging.error(f"[{self.symbol}] Error saat mengambil snapshot REST: {e}", exc_info=True)
+            self.is_synced = False
+            return False
 
     async def _handle_websocket_message(self, message):
-        if self.msg_queue.qsize() > 5000: # Mengurangi ukuran queue, agar tidak terlalu menumpuk
+        if self.msg_queue.qsize() > 5000: 
             logging.warning(f"[{self.symbol}] Message queue penuh ({self.msg_queue.qsize()}), membuang pesan lama.")
             try: 
-                # Buang sebagian pesan lama untuk memberi ruang
                 for _ in range(self.msg_queue.qsize() // 2): 
                     self.msg_queue.get_nowait()
             except asyncio.QueueEmpty:
@@ -126,31 +126,25 @@ class OrderBookManager:
 
                     async with self.snapshot_lock:
                         if not self.is_synced:
-                            # Jika belum sinkron (misal setelah re-sync signal), biarkan pesan terkumpul
                             await asyncio.sleep(0.001) 
                             continue
 
-                        # Jika WS stream memiliki ID yang lebih rendah atau sama, lewati (sudah diproses)
                         if final_update_id <= self.last_update_id:
                             continue
 
                         # Pengecekan Out of Sync
-                        if first_update_id > self.last_update_id + 1 and self.last_update_id != -1:
-                            if self.initial_sync_grace_period:
-                                # Jika masih dalam grace period, coba abaikan dan lanjutkan proses
-                                # Ini untuk mengakomodasi lonjakan ID di awal setelah koneksi/re-sync
-                                logging.warning(f"[{self.symbol}] Detected potential out of sync (Grace Period). "
-                                                f"First WS ID: {first_update_id}, Last local ID: {self.last_update_id}. Continuing for now.")
-                                self.initial_sync_grace_period = False # Grace period hanya berlaku sekali setelah sync
-                            else:
-                                logging.warning(f"[{self.symbol}] Out of sync or missed messages. "
-                                                f"First WS ID: {first_update_id}, Last local ID: {self.last_update_id}. Signaling for re-sync.")
-                                self.is_synced = False # Set unsynced, main loop akan melihat ini
-                                # Kosongkan queue untuk data yang sudah basi
-                                while not self.msg_queue.empty():
-                                    try: self.msg_queue.get_nowait()
-                                    except asyncio.QueueEmpty: break
-                                continue 
+                        # Check if we are within the grace period
+                        if time.time() < self.initial_sync_grace_period_end_time:
+                            # Skip strict ID check during grace period, just process the update
+                            pass # Process update below
+                        elif first_update_id > self.last_update_id + 1 and self.last_update_id != -1:
+                            logging.warning(f"[{self.symbol}] Out of sync or missed messages. "
+                                            f"First WS ID: {first_update_id}, Last local ID: {self.last_update_id}. Signaling for re-sync.")
+                            self.is_synced = False 
+                            while not self.msg_queue.empty():
+                                try: self.msg_queue.get_nowait()
+                                except asyncio.QueueEmpty: break
+                            continue 
 
                         # Update orderbook
                         for price_str, qty_str in data['b']:
@@ -170,7 +164,10 @@ class OrderBookManager:
                                 self.asks[price] = qty
 
                         self.last_update_id = final_update_id
-                        self.initial_sync_grace_period = False # Reset grace period setelah update berhasil
+                        # Extend grace period if updates are coming in fast and smoothly
+                        # This avoids the "too early" out of sync if there's a continuous stream of large jumps
+                        self.initial_sync_grace_period_end_time = time.time() + 1 # Extend by 1 second for each successful update during initial phase
+
                 except asyncio.TimeoutError:
                     if self._closing: break
                     continue 
@@ -184,7 +181,6 @@ class OrderBookManager:
         finally:
             self._process_messages_running = False
 
-
     async def _websocket_connect(self):
         while not self._closing:
             try:
@@ -194,7 +190,7 @@ class OrderBookManager:
                     
                     self.last_update_id = -1
                     self.is_synced = False 
-                    self.initial_sync_grace_period = True # Reset grace period saat koneksi baru
+                    self.initial_sync_grace_period_end_time = 0 # Reset grace period
 
                     while not self.msg_queue.empty():
                         try: self.msg_queue.get_nowait()
@@ -288,6 +284,7 @@ class OrderBookManager:
         self.asks = {}
         self.last_update_id = -1
         self.is_synced = False
+        self.initial_sync_grace_period_end_time = 0 # Reset grace period on stop
         while not self.msg_queue.empty():
             try:
                 self.msg_queue.get_nowait()
@@ -504,12 +501,11 @@ async def wait_until_pre_close(next_candle_close_utc):
         if now_utc >= pre_close_time_utc:
             logging.info(f"[INFO] Waktu pelacakan dimulai: {datetime.now().strftime('%H:%M:%S')}")
             return next_candle_close_utc
-        await asyncio.sleep(5) # Gunakan asyncio.sleep dalam async function
+        await asyncio.sleep(5) 
 
 async def perform_analysis_and_send_report(spot_ob_manager, futures_ob_manager, report_time_utc, report_label):
     wib_tz = timezone(timedelta(hours=7)) 
     
-    # Try to ensure both managers are synced before proceeding
     managers = {'Spot': spot_ob_manager, 'Futures': futures_ob_manager}
     for name, manager in managers.items():
         max_retries = 3
@@ -518,16 +514,13 @@ async def perform_analysis_and_send_report(spot_ob_manager, futures_ob_manager, 
                 break
             logging.warning(f"[REPORT - {report_label}] {name} OrderBookManager belum sinkron atau sedang menutup (Percobaan {attempt+1}/{max_retries}). Mencoba memulai ulang...")
             await manager.stop() 
-            await asyncio.sleep(3) # Jeda lebih lama
+            await asyncio.sleep(3) 
             await manager.start()
-            await asyncio.sleep(7) # Beri waktu lebih untuk sinkronisasi
-        else: # This else block executes if the loop completes (i.e., all retries failed)
+            await asyncio.sleep(7) 
+        else: 
             logging.error(f"[REPORT - {report_label}] {name} OrderBookManager gagal sinkron setelah {max_retries} percobaan. Tidak dapat membuat laporan.")
-            # Critical decision: if one fails after retries, do we stop entirely or continue with partial?
-            # For now, let's stop this specific report attempt if a manager can't sync.
             return 
     
-    # Final check after all retries
     if spot_ob_manager._closing or futures_ob_manager._closing:
         logging.warning(f"[REPORT - {report_label}] Salah satu OrderBookManager sedang dalam proses penutupan setelah retry. Melewatkan pembuatan laporan.")
         return 
@@ -591,10 +584,13 @@ Pelacakan: {TRACK_DURATION} detik (sebelum penutupan), Real-time via WebSocket
 async def main():
     logging.info(f"=== {PAIR} ORDERBOOK WALL DETECTOR (SPOT + FUTURES) DIMULAI ===")
 
-    # Initialize managers outside the loop so they persist
-    global spot_ob_manager, futures_ob_manager # Declare as global to be accessible by cleanup_on_exit
-    spot_ob_manager = OrderBookManager(PAIR + ' (Spot)', SPOT_REST_URL, SPOT_WS_URL)
-    futures_ob_manager = OrderBookManager(PAIR + ' (Futures)', FUTURES_REST_URL, FUTURES_WS_URL, is_futures=True)
+    # Create a single aiohttp session for all REST calls
+    global aiohttp_session
+    aiohttp_session = aiohttp.ClientSession()
+
+    global spot_ob_manager, futures_ob_manager 
+    spot_ob_manager = OrderBookManager(PAIR + ' (Spot)', SPOT_REST_URL, SPOT_WS_URL, aiohttp_session)
+    futures_ob_manager = OrderBookManager(PAIR + ' (Futures)', FUTURES_REST_URL, FUTURES_WS_URL, aiohttp_session, is_futures=True)
 
     await spot_ob_manager.start()
     await futures_ob_manager.start()
@@ -609,23 +605,19 @@ async def main():
 
     while True:
         try:
-            # Periksa dan tangani status "is_synced" dari manager secara berkala
-            # Jika salah satu tidak sinkron, paksa restart penuh untuk manager tersebut
             for name, manager in {'Spot': spot_ob_manager, 'Futures': futures_ob_manager}.items():
                 if not manager.is_synced:
                     logging.warning(f"[MAIN LOOP] {name} OrderBookManager terdeteksi UNSYNCED. Memaksa restart penuh...")
                     await manager.stop()
                     # Re-create the manager object to ensure a clean state
                     if name == 'Spot':
-                        spot_ob_manager = OrderBookManager(PAIR + ' (Spot)', SPOT_REST_URL, SPOT_WS_URL)
-                        await spot_ob_manager.start()
+                        spot_ob_manager = OrderBookManager(PAIR + ' (Spot)', SPOT_REST_URL, SPOT_WS_URL, aiohttp_session)
                     else: # Futures
-                        futures_ob_manager = OrderBookManager(PAIR + ' (Futures)', FUTURES_REST_URL, FUTURES_WS_URL, is_futures=True)
-                        await futures_ob_manager.start()
-                    await asyncio.sleep(10) # Beri waktu untuk re-sync setelah restart penuh
-                    if not manager.is_synced: # Check again, if still not synced after restart, something is seriously wrong
+                        futures_ob_manager = OrderBookManager(PAIR + ' (Futures)', FUTURES_REST_URL, FUTURES_WS_URL, aiohttp_session, is_futures=True)
+                    await manager.start() # Start the newly created/updated manager
+                    await asyncio.sleep(10) 
+                    if not manager.is_synced: 
                         logging.error(f"[MAIN LOOP] {name} OrderBookManager GAGAL sinkron setelah restart penuh. Akan mencoba lagi di siklus berikutnya.")
-                        # Consider a longer sleep or exit if persistent failure
                         continue 
 
             next_close_time_utc = get_next_candle_close_time()
@@ -649,12 +641,15 @@ async def main():
         except RecursionError as re: 
             logging.critical(f"[ERROR - Main Loop FATAL] RecursionError terdeteksi: {re}. Bot akan mencoba restart total.")
             try:
+                if aiohttp_session and not aiohttp_session.closed:
+                    await aiohttp_session.close()
                 await spot_ob_manager.stop()
                 await futures_ob_manager.stop()
                 await asyncio.sleep(15) 
-                # Re-create manager objects to ensure clean state
-                spot_ob_manager = OrderBookManager(PAIR + ' (Spot)', SPOT_REST_URL, SPOT_WS_URL)
-                futures_ob_manager = OrderBookManager(PAIR + ' (Futures)', FUTURES_REST_URL, FUTURES_WS_URL, is_futures=True)
+                # Re-create session and managers for a truly clean restart
+                aiohttp_session = aiohttp.ClientSession()
+                spot_ob_manager = OrderBookManager(PAIR + ' (Spot)', SPOT_REST_URL, SPOT_WS_URL, aiohttp_session)
+                futures_ob_manager = OrderBookManager(PAIR + ' (Futures)', FUTURES_REST_URL, FUTURES_WS_URL, aiohttp_session, is_futures=True)
                 await spot_ob_manager.start()
                 await futures_ob_manager.start()
                 await asyncio.sleep(15) 
@@ -668,9 +663,13 @@ async def main():
             logging.info("Mencoba me-restart OrderBookManager untuk pemulihan...")
             
             try:
+                # Reuse existing session, but stop/start managers
                 await spot_ob_manager.stop()
                 await futures_ob_manager.stop()
                 await asyncio.sleep(5)
+                # Re-create managers, passing the existing session
+                spot_ob_manager = OrderBookManager(PAIR + ' (Spot)', SPOT_REST_URL, SPOT_WS_URL, aiohttp_session)
+                futures_ob_manager = OrderBookManager(PAIR + ' (Futures)', FUTURES_REST_URL, FUTURES_WS_URL, aiohttp_session, is_futures=True)
                 await spot_ob_manager.start()
                 await futures_ob_manager.start()
                 await asyncio.sleep(10)
@@ -681,6 +680,7 @@ async def main():
 # Global references for cleanup_on_exit
 spot_ob_manager = None
 futures_ob_manager = None
+aiohttp_session = None # Global for the session as well
 
 if __name__ == '__main__':
     if DISCORD_WEBHOOK_URL == 'https://discord.com/api/webhooks/YOUR_DISCORD_WEBHOOK_URL_HERE':
@@ -688,32 +688,29 @@ if __name__ == '__main__':
         exit()
     
     async def cleanup_on_exit_global():
-        # Use the global manager objects if they exist
         if spot_ob_manager:
             await spot_ob_manager.stop()
         if futures_ob_manager:
             await futures_ob_manager.stop()
-        logging.info("Global managers cleanup completed.")
+        if aiohttp_session and not aiohttp_session.closed:
+            await aiohttp_session.close() # Close the shared session
+        logging.info("Global managers and aiohttp session cleanup completed.")
 
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         logging.info("Bot dihentikan oleh pengguna (KeyboardInterrupt). Melakukan cleanup...")
         try:
-            # Ensure the event loop is running to run async cleanup task
             loop = asyncio.get_running_loop()
             if loop.is_running():
-                # Schedule the cleanup task in the existing loop
                 loop.create_task(cleanup_on_exit_global())
-                loop.run_until_complete(asyncio.sleep(1)) # Give it a moment to run
+                loop.run_until_complete(asyncio.sleep(1)) 
             else:
-                # If no loop is running, create and run a new one for cleanup
                 asyncio.run(cleanup_on_exit_global())
-        except RuntimeError: # No running event loop to attach to initially
+        except RuntimeError: 
              asyncio.run(cleanup_on_exit_global())
         except Exception as cleanup_e:
             logging.error(f"Error during cleanup_on_exit: {cleanup_e}", exc_info=True)
 
     except Exception as e:
         logging.error(f"Error fatal di luar main loop: {e}", exc_info=True)
-
