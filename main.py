@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 PAIR = 'BTCUSDT'
 # ====================================================================
 # VVVVVV SARAN PENYESUAIAN KONFIGURASI VVVVVV
-STEP = 10 # Pembulatan harga untuk pengelompokan orderbook. Semakin kecil, semakin detail.
+STEP = 100# Pembulatan harga untuk pengelompokan orderbook. Semakin kecil, semakin detail.
 DEPTH = 1000 # Maksimal limit orderbook yang bisa diambil dari Binance API REST untuk initial snapshot.
              # Untuk WebSocket, ini lebih ke batas tampilan awal saja.
 
