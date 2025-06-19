@@ -7,7 +7,7 @@ import websockets
 import logging
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
-
+import math 
 # --- KONFIGURASI ---
 # Sesuaikan parameter ini sesuai kebutuhan Anda.
 PAIR = 'BTCUSDT'
