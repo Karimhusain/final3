@@ -1,777 +1,446 @@
-import requests
-import time
-import json
 import asyncio
 import aiohttp
-import websockets
+import datetime
+import numpy as np
+import pytz
+import os
 import logging
-import numpy as np  # Tambahkan import numpy
-from collections import defaultdict, deque
-from datetime import datetime, timedelta, timezone
-import math
-import sys
+import time
+
+# --- Konfigurasi Logging ---
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(message)s',
+                    handlers=[
+                        logging.FileHandler("orderbook_monitor.log"),
+                        logging.StreamHandler()
+                    ])
 
 # --- KONFIGURASI ---
-PAIR = 'BTCUSDT'
-STEP = 100 # Tetap 100 sesuai yang Anda inginkan
-DEPTH = 1000
+DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1382392547594342521/nzmNqCuwQzlgeq5PKh6pj4YdXCNd10iQFOlGPEvrpmI8qu20pUs9W3NJdl-185Y2rRf9"
 
-# !!! PENTING: NILAI-NILAI INI PERLU DISESUAIKAN KARENA SEKARANG ADALAH TOTAL QTY DALAM STEP !!!
-# Anda harus mengamati output pertama kali setelah perubahan ini
-# dan sesuaikan kembali nilai-nilai ini agar sesuai dengan yang Anda anggap "Wall" atau "Spoof"
-WALL_THRESHOLD_MAIN = 200   # Contoh: mungkin 50 BTC total dalam 100 poin harga adalah "Main Wall"
-WALL_THRESHOLD_MINOR = 100  # Contoh: mungkin 20 BTC total dalam 100 poin harga adalah "Minor Wall"
+PRICE_INTERVAL = 500  # Interval pengelompokan harga
+TOP_LEVELS = 10       # Jumlah level teratas yang ditampilkan
+CANDLE_INTERVAL_MINUTES = 15 # Interval candle Binance untuk sinkronisasi pengiriman
 
-SPOOF_DETECTION_THRESHOLD_PERCENT = 0.5
-SPOOF_QUANTITY_MIN = 100    # Contoh: hanya cek spoofing untuk total kuantitas step >= 10 BTC
+EXCHANGES = {
+    'binance': {
+        'url': 'https://api.binance.com/api/v3/depth',
+        'params': {'symbol': 'BTCUSDT', 'limit': 100},
+        'spot': True,
+        'min_delay_ms': 50
+    },
+    'bitget': {
+        'url': 'https://api.bitget.com/api/spot/v1/market/depth',
+        'params': {'symbol': 'BTCUSDT_SPBL', 'limit': 100},
+        'spot': True,
+        'min_delay_ms': 50
+    },
+    'bitget_futures': {
+        'url': 'https://api.bitget.com/api/mix/v1/market/depth',
+        'params': {'symbol': 'BTCUSDT_UMCBL', 'limit': 100},
+        'spot': False,
+        'min_delay_ms': 50
+    },
+    'okx': {
+        'url': 'https://www.okx.com/api/v5/market/books',
+        'params': {'instId': 'BTC-USDT', 'sz': 100},
+        'spot': True,
+        'min_delay_ms': 100
+    },
+    'coinbase': {
+        'url': 'https://api.exchange.coinbase.com/products/BTC-USDT/book',
+        'params': {'level': 2},
+        'spot': True,
+        'min_delay_ms': 100
+    },
+    'bybit': {
+        'url': 'https://api.bybit.com/v5/market/orderbook',
+        'params': {'category': 'spot', 'symbol': 'BTCUSDT'},
+        'spot': True,
+        'min_delay_ms': 50
+    }
+}
 
-STABILITY_TOLERANCE_PERCENT = 0.2
+last_request_time = {name: 0 for name in EXCHANGES}
 
-MAX_DISPLAY_LINES = 5 # Ditingkatkan agar bisa melihat lebih banyak 'wall'
 
-TRACK_INTERVAL = 3
-TRACK_DURATION = 60
+# --- FUNGSI BANTUAN (HELPERS) ---
+def group_price(price: float) -> int:
+    """Membulatkan harga ke interval harga terdekat yang ditentukan oleh PRICE_INTERVAL."""
+    return int(round(price / PRICE_INTERVAL) * PRICE_INTERVAL)
 
-DISCORD_WEBHOOK_URL = 'https://discord.com/api/webhooks/1390653204903104595/tRtyISpu-RaH_p1UtrhDJRzCW2Vtrh_SrKCd5ivfMk-vOB7oVzHlSkl4esTfZiItmmg0'
+def format_volume(vol: float) -> str:
+    """Memformat volume BTC ke string dengan 2 angka desimal."""
+    return f"{vol:.2f} BTC"
 
-# --- KONFIGURASI LOGGING ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+def utc_now() -> str:
+    """Mengembalikan waktu UTC saat ini dalam format string (YYYY-MM-DD HH:MM:SS UTC)."""
+    return datetime.datetime.now(pytz.UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-# --- URL API BINANCE ---
-SPOT_REST_URL = f'https://api.binance.com/api/v3/depth?symbol={PAIR}&limit={DEPTH}'
-FUTURES_REST_URL = f'https://fapi.binance.com/fapi/v1/depth?symbol={PAIR}&limit={DEPTH}'
-
-SPOT_WS_URL = f'wss://stream.binance.com:9443/ws/{PAIR.lower()}@depth'
-FUTURES_WS_URL = f'wss://fstream.binance.com/ws/{PAIR.lower()}@depth'
-
-# --- SET RECURSION LIMIT ---
-sys.setrecursionlimit(2000) 
-
-# --- FUNGSI PEMBANTU ---
-def get_price_step(price):
-    return math.floor(float(price) / STEP) * STEP
-
-# Mengubah fungsi untuk menerima 'side' sebagai parameter
-def _get_label_from_analysis(avg_qty, is_stable, is_spoof, side):
-    label = ""
+def calculate_next_candle_close_time(interval_minutes: int) -> datetime.datetime:
+    """
+    Menghitung waktu penutupan candle berikutnya berdasarkan interval tertentu.
+    Akan selalu mengembalikan waktu yang akan datang.
+    """
+    now_utc = datetime.datetime.now(pytz.UTC)
     
-    # Prioritaskan label SPOOFING jika terdeteksi
-    if is_spoof and avg_qty >= SPOOF_QUANTITY_MIN: # Pastikan kuantitas juga memenuhi SPOOF_QUANTITY_MIN
-        label = '⚠️ SPOOFING?'
-    elif avg_qty >= WALL_THRESHOLD_MAIN:
-        label = '🟥🟥🟥 WALL' if is_stable else '⚠️ Fake Wall'
-    elif avg_qty >= WALL_THRESHOLD_MINOR:
-        label = '(Minor Wall)' if is_stable else '(Minor Fake Wall)'
+    # Hitung total menit sejak awal hari (UTC)
+    total_minutes_today = now_utc.hour * 60 + now_utc.minute
     
-    return label
+    # Cari menit terdekat yang merupakan kelipatan dari interval_minutes
+    minutes_to_next_interval = interval_minutes - (total_minutes_today % interval_minutes)
+    
+    # Tambahkan menit tersebut ke waktu sekarang
+    next_close_time = now_utc + datetime.timedelta(minutes=minutes_to_next_interval)
+    
+    # Normalisasi ke menit genap (detik dan mikrodetik menjadi 0)
+    next_close_time = next_close_time.replace(second=0, microsecond=0)
+    
+    logging.info(f"Waktu UTC saat ini: {now_utc.strftime('%H:%M:%S')}. Penutupan candle {interval_minutes} menit berikutnya pada: {next_close_time.strftime('%H:%M:%S UTC')}")
+    return next_close_time
 
-# --- KELAS ORDERBOOK MANAGER (WebSocket) ---
-class OrderBookManager:
-    def __init__(self, symbol, rest_url, ws_url, session, is_futures=False):
-        self.symbol = symbol
-        self.rest_url = rest_url
-        self.ws_url = ws_url
-        self.session = session # Re-use aiohttp session
-        self.is_futures = is_futures
-        # Mengubah struktur bids/asks untuk menyimpan order individual di setiap step
-        # Format: {price_step: {order_price: qty, order_price: qty, ...}}
-        self.bids_by_step = defaultdict(dict)
-        self.asks_by_step = defaultdict(dict)
-        self.last_update_id = -1
-        self.msg_queue = asyncio.Queue()
-        self.processing_task = None
-        self.ws_task = None
-        self.reconnect_delay = 1
-        self.snapshot_lock = asyncio.Lock()
-        self.is_synced = False
-        self._closing = False 
-        self._process_messages_running = False 
-        self.initial_sync_grace_period_end_time = 0 # Timestamp for grace period
 
-    async def _fetch_initial_snapshot(self):
+# --- FUNGSI PENGAMBIL DATA (FETCHERS) ---
+async def fetch_orderbook(session: aiohttp.ClientSession, name: str, config: dict, retries: int = 3) -> tuple:
+    """
+    Mengambil data order book dari API bursa tertentu dengan penanganan retry dan rate limit.
+    """
+    min_delay = config.get('min_delay_ms', 0) / 1000
+
+    for attempt in range(retries):
+        current_time_monotonic = time.monotonic() # Ganti nama variabel agar tidak bentrok
+        elapsed_time = current_time_monotonic - last_request_time[name]
+        if elapsed_time < min_delay:
+            wait_time = min_delay - elapsed_time
+            logging.debug(f"Menunggu {wait_time:.2f} detik untuk memenuhi min_delay pada {name}.")
+            await asyncio.sleep(wait_time)
+        
+        last_request_time[name] = time.monotonic()
+
         try:
-            logging.info(f"[{self.symbol}] Mengambil snapshot REST awal...")
-            async with self.session.get(self.rest_url, timeout=10) as resp:
+            async with session.get(config['url'], params=config['params'], timeout=10) as resp:
+                if resp.status == 429:
+                    retry_after = resp.headers.get('Retry-After')
+                    sleep_duration = int(retry_after) if retry_after else (2 ** attempt) * 5
+                    logging.warning(f"Percobaan {attempt + 1}/{retries}: Terkena rate limit dari {name} (status 429). Menunggu {sleep_duration} detik.")
+                    await asyncio.sleep(sleep_duration)
+                    continue
+                
                 resp.raise_for_status()
                 data = await resp.json()
+
+                asks = []
+                bids = []
+
+                if name == 'okx':
+                    if data and 'data' in data and data['data']:
+                        asks = [[float(x[0]), float(x[1])] for x in data['data'][0].get('asks', [])]
+                        bids = [[float(x[0]), float(x[1])] for x in data['data'][0].get('bids', [])]
+                elif name == 'coinbase':
+                    asks = [[float(x[0]), float(x[1])] for x in data.get('asks', [])]
+                    bids = [[float(x[0]), float(x[1])] for x in data.get('bids', [])]
+                elif name == 'bybit':
+                    if data and isinstance(data, dict) and 'result' in data and isinstance(data['result'], dict):
+                        asks = [[float(x['price']), float(x['size'])] for x in data['result'].get('a', []) if isinstance(x, dict) and 'price' in x and 'size' in x]
+                        bids = [[float(x['price']), float(x['size'])] for x in data['result'].get('b', []) if isinstance(x, dict) and 'price' in x and 'size' in x]
+                    else:
+                        logging.warning(f"Respon Bybit tidak memiliki format 'result' yang diharapkan: {data}")
+                        return name, config['spot'], [], []
+                else: # Untuk Binance, Bitget, dll. yang formatnya mirip [[price, volume], ...]
+                    asks = [[float(x[0]), float(x[1])] for x in data.get('asks', [])]
+                    bids = [[float(x[0]), float(x[1])] for x in data.get('bids', [])]
                 
-                # Menginisialisasi bids_by_step dan asks_by_step dari snapshot
-                self.bids_by_step.clear()
-                self.asks_by_step.clear()
+                logging.info(f"Berhasil mengambil data dari {name}.")
+                return name, config['spot'], asks, bids
 
-                for price_str, qty_str in data['bids']:
-                    price = float(price_str)
-                    qty = float(qty_str)
-                    price_step = get_price_step(price)
-                    self.bids_by_step[price_step][price] = qty # Simpan harga asli di dalam step
-
-                for price_str, qty_str in data['asks']:
-                    price = float(price_str)
-                    qty = float(qty_str)
-                    price_step = get_price_step(price)
-                    self.asks_by_step[price_step][price] = qty # Simpan harga asli di dalam step
-                    
-                self.last_update_id = data['lastUpdateId']
-                logging.info(f"[{self.symbol}] Snapshot REST berhasil diambil. lastUpdateId: {self.last_update_id}. Jumlah bids_by_step: {len(self.bids_by_step)}, asks_by_step: {len(self.asks_by_step)}")
-                self.is_synced = True
-                self.initial_sync_grace_period_end_time = time.time() + 5 
-                return True
+        except aiohttp.ClientResponseError as e:
+            logging.warning(f"Percobaan {attempt + 1}/{retries}: Kesalahan HTTP dari {name} (Status: {e.status}): {e}. Respons: {await e.response.text() if e.response else 'N/A'}")
+            sleep_duration = (2 ** attempt) * 2
+            await asyncio.sleep(sleep_duration)
         except aiohttp.ClientError as e:
-            logging.error(f"[{self.symbol}] Gagal mengambil snapshot REST: {e}")
-            self.is_synced = False
-            return False
+            logging.warning(f"Percobaan {attempt + 1}/{retries}: Kesalahan klien (jaringan/timeout) saat mengambil {name}: {e}")
+            sleep_duration = (2 ** attempt) * 2
+            await asyncio.sleep(sleep_duration)
         except Exception as e:
-            logging.error(f"[{self.symbol}] Error saat mengambil snapshot REST: {e}", exc_info=True)
-            self.is_synced = False
-            return False
+            logging.error(f"Percobaan {attempt + 1}/{retries}: Kesalahan tidak terduga saat mengambil {name}: {e}", exc_info=True)
+            sleep_duration = (2 ** attempt) * 5
+            await asyncio.sleep(sleep_duration)
+    
+    logging.error(f"Gagal mengambil data dari {name} setelah {retries} percobaan.")
+    return name, config['spot'], [], []
 
-    async def _handle_websocket_message(self, message):
-        if self.msg_queue.qsize() > 5000: 
-            logging.warning(f"[{self.symbol}] Message queue penuh ({self.msg_queue.qsize()}), membuang pesan lama.")
-            try: 
-                for _ in range(self.msg_queue.qsize() // 2): 
-                    self.msg_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                pass
-        await self.msg_queue.put(message)
-
-    async def _process_messages(self):
-        self._process_messages_running = True
-        try:
-            while not self._closing:
-                try:
-                    msg = await asyncio.wait_for(self.msg_queue.get(), timeout=1.0) 
-                    data = json.loads(msg)
-                    
-                    final_update_id = data.get('u') or data.get('lastUpdateId')
-                    first_update_id = data.get('U') or final_update_id
-
-                    if not final_update_id:
-                        continue
-
-                    async with self.snapshot_lock:
-                        if not self.is_synced:
-                            await asyncio.sleep(0.001) 
-                            continue
-
-                        if final_update_id <= self.last_update_id:
-                            continue
-
-                        if time.time() < self.initial_sync_grace_period_end_time:
-                            pass 
-                        elif first_update_id > self.last_update_id + 1 and self.last_update_id != -1:
-                            logging.warning(f"[{self.symbol}] Out of sync or missed messages. "
-                                            f"First WS ID: {first_update_id}, Last local ID: {self.last_update_id}. Signaling for re-sync.")
-                            self.is_synced = False 
-                            while not self.msg_queue.empty():
-                                try: self.msg_queue.get_nowait()
-                                except asyncio.QueueEmpty: break
-                            continue 
-
-                        # Update orderbook by price step
-                        for price_str, qty_str in data['b']:
-                            price = float(price_str)
-                            qty = float(qty_str)
-                            price_step = get_price_step(price)
-                            if qty == 0:
-                                self.bids_by_step[price_step].pop(price, None)
-                                if not self.bids_by_step[price_step]: # Hapus step jika kosong
-                                    self.bids_by_step.pop(price_step, None)
-                            else:
-                                self.bids_by_step[price_step][price] = qty
-
-                        for price_str, qty_str in data['a']:
-                            price = float(price_str)
-                            qty = float(qty_str)
-                            price_step = get_price_step(price)
-                            if qty == 0:
-                                self.asks_by_step[price_step].pop(price, None)
-                                if not self.asks_by_step[price_step]: # Hapus step jika kosong
-                                    self.asks_by_step.pop(price_step, None)
-                            else:
-                                self.asks_by_step[price_step][price] = qty
-
-                        self.last_update_id = final_update_id
-                        self.initial_sync_grace_period_end_time = time.time() + 1 
-
-                except asyncio.TimeoutError:
-                    if self._closing: break
-                    continue 
-                except asyncio.CancelledError:
-                    logging.info(f"[{self.symbol}] _process_messages task cancelled.")
-                    break
-                except json.JSONDecodeError:
-                    logging.error(f"[{self.symbol}] Gagal mendecode JSON dari pesan WebSocket: {msg[:200]}...")
-                except Exception as e:
-                    logging.error(f"[{self.symbol}] Error saat memproses pesan WebSocket: {e}", exc_info=True)
-        finally:
-            self._process_messages_running = False
-
-    async def _websocket_connect(self):
-        while not self._closing:
-            try:
-                logging.info(f"[{self.symbol}] Menghubungkan ke WebSocket: {self.ws_url}")
-                async with websockets.connect(self.ws_url, ping_interval=30, ping_timeout=10) as ws:
-                    logging.info(f"[{self.symbol}] WebSocket terhubung.")
-                    
-                    self.last_update_id = -1
-                    self.is_synced = False 
-                    self.initial_sync_grace_period_end_time = 0 
-
-                    while not self.msg_queue.empty():
-                        try: self.msg_queue.get_nowait()
-                        except asyncio.QueueEmpty: break
-                    
-                    if not await self._fetch_initial_snapshot():
-                        logging.error(f"[{self.symbol}] Gagal ambil snapshot awal. Menutup WS dan coba lagi.")
-                        await ws.close()
-                        await asyncio.sleep(self.reconnect_delay)
-                        continue
-                    
-                    logging.info(f"[{self.symbol}] WebSocket & REST snapshot sinkron. Mulai menerima pesan.")
-                    self.reconnect_delay = 1 
-
-                    while not self._closing and self.is_synced: 
-                        try:
-                            message = await asyncio.wait_for(ws.recv(), timeout=30) 
-                            await self._handle_websocket_message(message)
-                        except asyncio.TimeoutError:
-                            logging.warning(f"[{self.symbol}] WebSocket recv timeout, koneksi mungkin stagnan. Memaksa ping.")
-                            try:
-                                await ws.ping()
-                            except websockets.exceptions.ConnectionClosed:
-                                logging.error(f"[{self.symbol}] Ping gagal, koneksi sudah terputus.")
-                                break
-                        except websockets.exceptions.ConnectionClosedOK:
-                            logging.info(f"[{self.symbol}] WebSocket connection closed normally.")
-                            break
-                        except websockets.exceptions.ConnectionClosedError as e:
-                            logging.error(f"[{self.symbol}] WebSocket connection closed with error: {e}")
-                            break
-                        except Exception as e:
-                            logging.error(f"[{self.symbol}] Error saat menerima pesan WS: {e}", exc_info=True)
-                            break
-                if not self._closing:
-                    logging.info(f"[{self.symbol}] WebSocket connection lost. Reconnecting...")
-
-            except asyncio.CancelledError:
-                logging.info(f"[{self.symbol}] _websocket_connect task cancelled.")
-                break 
-            except websockets.exceptions.WebSocketException as e:
-                logging.error(f"[{self.symbol}] WebSocket connection failed: {e}. Retrying in {self.reconnect_delay}s...")
-            except Exception as e:
-                logging.error(f"[{self.symbol}] Error umum di _websocket_connect: {e}", exc_info=True)
-
-            if not self._closing:
-                await asyncio.sleep(self.reconnect_delay)
-                self.reconnect_delay = min(self.reconnect_delay * 2, 60)
-
-    async def get_current_orderbook(self):
-        async with self.snapshot_lock:
-            # Mengembalikan salinan deep dari defaultdict agar tidak ada modifikasi eksternal
-            current_bids = {price_step: dict(orders) for price_step, orders in self.bids_by_step.items()}
-            current_asks = {price_step: dict(orders) for price_step, orders in self.asks_by_step.items()}
-            return current_bids, current_asks
-
-    async def start(self):
-        if self.ws_task and not self.ws_task.done():
-            logging.info(f"[{self.symbol}] WS task already running, skipping start.")
-            return
-        if self.processing_task and not self.processing_task.done():
-            logging.info(f"[{self.symbol}] Processing task already running, skipping start.")
-            return
-        
-        self._closing = False
-        self.ws_task = asyncio.create_task(self._websocket_connect())
-        self.processing_task = asyncio.create_task(self._process_messages())
-        logging.info(f"[{self.symbol}] OrderBookManager tasks started.")
-
-    async def stop(self):
-        if self._closing:
-            logging.info(f"[{self.symbol}] OrderBookManager already in closing process.")
-            return
-
-        self._closing = True
-
-        logging.info(f"[{self.symbol}] Stopping OrderBookManager tasks...")
-        tasks_to_cancel = []
-        if self.ws_task:
-            if not self.ws_task.done():
-                self.ws_task.cancel()
-                tasks_to_cancel.append(self.ws_task)
-            self.ws_task = None
-        if self.processing_task:
-            if not self.processing_task.done():
-                self.processing_task.cancel()
-                tasks_to_cancel.append(self.processing_task)
-            self.processing_task = None
-        
-        if tasks_to_cancel:
-            await asyncio.gather(*tasks_to_cancel, return_exceptions=True) 
-
-        self.bids_by_step.clear()
-        self.asks_by_step.clear()
-        self.last_update_id = -1
-        self.is_synced = False
-        self.initial_sync_grace_period_end_time = 0 
-        while not self.msg_queue.empty():
-            try:
-                self.msg_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-        
-        self._closing = False
-        logging.info(f"[{self.symbol}] OrderBookManager stopped.")
-
-# --- FUNGSI ANALISIS & FORMATTING ---
-async def track_and_analyze_orderbook_websocket(orderbook_manager):
-    logging.info(f"[INFO] Melacak orderbook WebSocket untuk {orderbook_manager.symbol} selama {TRACK_DURATION} detik...")
-
-    effective_maxlen = max(1, int(TRACK_DURATION / TRACK_INTERVAL)) if TRACK_INTERVAL > 0 else 1
-
-    # Mengubah struktur orderbook_history untuk menyimpan total_qty_in_step per snapshot
-    orderbook_history = defaultdict(lambda: {'buy': deque(maxlen=effective_maxlen),
-                                             'sell': deque(maxlen=effective_maxlen)})
-    end_time = time.time() + TRACK_DURATION
-    snapshot_count = 0
-
-    while time.time() < end_time:
-        if not orderbook_manager.is_synced or orderbook_manager._closing:
-            logging.warning(f"[{orderbook_manager.symbol}] OrderBookManager belum sinkron atau sedang menutup. Menunda pelacakan snapshot...")
-            await asyncio.sleep(TRACK_INTERVAL)
+# --- FUNGSI PEMROSESAN DATA (PROCESSING) ---
+def aggregate_orderbooks(all_books: list) -> tuple:
+    """
+    Menggabungkan data order book dari berbagai bursa dan mengelompokkan
+    kuantitas berdasarkan interval harga yang ditentukan (PRICE_INTERVAL).
+    Sekarang menyimpan kuantitas per bursa untuk deteksi wall.
+    """
+    # Key: (level, side), Value: {'total_spot': float, 'total_futures': float, 'exchanges': {exchange_name: quantity}}
+    grouped = {}
+    
+    for name, spot, asks, bids in all_books:
+        if not asks and not bids:
+            logging.warning(f"Tidak ada data asks/bids dari {name}, dilewati agregasi.")
             continue
-            
-        current_bids_by_step, current_asks_by_step = await orderbook_manager.get_current_orderbook()
-        
-        if not current_bids_by_step and not current_asks_by_step:
-            logging.warning(f"[{orderbook_manager.symbol}] Tidak ada data orderbook dari manager pada snapshot ini. Melanjutkan...")
-            await asyncio.sleep(TRACK_INTERVAL)
-            continue
-        
-        snapshot_count += 1
 
-        # Kumpulkan total kuantitas untuk setiap price_step di snapshot ini
-        for price_step, orders_in_step in current_bids_by_step.items():
-            if orders_in_step:
-                total_qty_in_this_step = sum(orders_in_step.values())
-                orderbook_history[price_step]['buy'].append(total_qty_in_this_step)
-        
-        for price_step, orders_in_step in current_asks_by_step.items():
-            if orders_in_step:
-                total_qty_in_this_step = sum(orders_in_step.values())
-                orderbook_history[price_step]['sell'].append(total_qty_in_this_step)
-        
-        await asyncio.sleep(TRACK_INTERVAL)
-    
-    logging.info(f"[INFO] Pelacakan selesai untuk {orderbook_manager.symbol}. Total snapshot: {snapshot_count}")
-    
-    final_history = {}
-    for price_step, data in orderbook_history.items():
-        final_history[price_step] = {
-            'buy': list(data['buy']) if data['buy'] else [],
-            'sell': list(data['sell']) if data['sell'] else []
-        }
-        
-    return final_history, snapshot_count
-
-def analyze_full_orderbook(orderbook_history, snapshot_count, is_futures=False):
-    analyzed_buy_levels = []
-    analyzed_sell_levels = []
-    total_buy_qty_overall = 0
-    total_sell_qty_overall = 0
-
-    if not orderbook_history:
-        logging.warning("[ANALYSIS] orderbook_history kosong, tidak ada analisis yang dilakukan.")
-        return [], [], "BALANCED (No data to analyze)"
-
-    all_price_steps = sorted(orderbook_history.keys())
-
-    # Analisis BUY ORDERS
-    temp_buy_levels = [] 
-    for price_step in sorted(all_price_steps, reverse=True): # Urutkan dari harga tertinggi ke terendah untuk BUY
-        history_of_total_buys_in_step = orderbook_history[price_step].get('buy', [])
-        
-        avg_qty = np.mean(history_of_total_buys_in_step) if history_of_total_buys_in_step else 0
-            
-        is_stable = True
-        is_spoof = False
-
-        if len(history_of_total_buys_in_step) >= 1: 
-            if len(history_of_total_buys_in_step) >= 2:
-                # Cek stabilitas berdasarkan fluktuasi total kuantitas
-                min_qty_in_history = np.min(history_of_total_buys_in_step)
-                max_qty_in_history = np.max(history_of_total_buys_in_step)
-                if avg_qty > 0 and (max_qty_in_history - min_qty_in_history) / avg_qty > STABILITY_TOLERANCE_PERCENT:
-                    is_stable = False
-            else: 
-                is_stable = True # Tidak bisa cek stabilitas dengan hanya 1 data
-
-            # Logika spoofing (berbasis total kuantitas per step)
-            if avg_qty >= SPOOF_QUANTITY_MIN and not is_stable:
-                # Jika total kuantitas step cukup besar dan tidak stabil, bisa jadi indikasi spoofing.
-                # Ini adalah interpretasi yang berbeda dari spoofing tradisional (muncul/hilang order besar).
-                is_spoof = True
-        
-        if avg_qty > 0:
-            label = _get_label_from_analysis(avg_qty, is_stable, is_spoof, 'buy') # Meneruskan 'buy'
-            temp_buy_levels.append({'price': price_step, 'qty': avg_qty, 'label': label, 'is_wall_or_spoof': bool(label)})
-            total_buy_qty_overall += avg_qty
-    
-    # Sortir dan hitung kumulatif
-    temp_buy_levels.sort(key=lambda x: x['price'], reverse=True)
-    cumulative_buy_qty_current = 0
-    for item in temp_buy_levels:
-        cumulative_buy_qty_current += item['qty']
-        analyzed_buy_levels.append({**item, 'cumulative_qty': cumulative_buy_qty_current})
-
-
-    # Analisis SELL ORDERS
-    temp_sell_levels = []
-    for price_step in sorted(all_price_steps, reverse=False): # Urutkan dari harga terendah ke tertinggi untuk SELL
-        history_of_total_sells_in_step = orderbook_history[price_step].get('sell', [])
-        
-        avg_qty = np.mean(history_of_total_sells_in_step) if history_of_total_sells_in_step else 0
-
-        is_stable = True
-        is_spoof = False
-
-        if len(history_of_total_sells_in_step) >= 1:
-            if len(history_of_total_sells_in_step) >= 2:
-                min_qty_in_history = np.min(history_of_total_sells_in_step)
-                max_qty_in_history = np.max(history_of_total_sells_in_step)
-                if avg_qty > 0 and (max_qty_in_history - min_qty_in_history) / avg_qty > STABILITY_TOLERANCE_PERCENT:
-                    is_stable = False
-            else:
-                is_stable = True
-
-            if avg_qty >= SPOOF_QUANTITY_MIN and not is_stable:
-                is_spoof = True
-        
-        if avg_qty > 0:
-            label = _get_label_from_analysis(avg_qty, is_stable, is_spoof, 'sell') # Meneruskan 'sell'
-            temp_sell_levels.append({'price': price_step, 'qty': avg_qty, 'label': label, 'is_wall_or_spoof': bool(label)})
-            total_sell_qty_overall += avg_qty
-    
-    # Sortir dan hitung kumulatif
-    temp_sell_levels.sort(key=lambda x: x['price'], reverse=False)
-    cumulative_sell_qty_current = 0
-    for item in temp_sell_levels:
-        cumulative_sell_qty_current += item['qty']
-        analyzed_sell_levels.append({**item, 'cumulative_qty': cumulative_sell_qty_current})
-
-    imbalance = 'BALANCED'
-    total_relevant_buy_qty = sum(item['qty'] for item in analyzed_buy_levels if item['is_wall_or_spoof'])
-    total_relevant_sell_qty = sum(item['qty'] for item in analyzed_sell_levels if item['is_wall_or_spoof'])
-
-    imbalance_detail = ""
-    if total_relevant_buy_qty > 0 or total_relevant_sell_qty > 0:
-        imbalance_detail = f" (Total Buy Wall/Spoof: {total_relevant_buy_qty:,.2f} BTC vs Total Sell Wall/Spoof: {total_relevant_sell_qty:,.2f} BTC)"
-
-    # Logika Imbalance ini berdasarkan 'Total Buy Wall/Spoof' dan 'Total Sell Wall/Spoof'
-    # Bukan berdasarkan total_buy_qty_overall dan total_sell_qty_overall yang mencakup semua qty
-    # Jika Anda ingin imbalance mencakup semua qty, ganti variabelnya.
-    if total_relevant_buy_qty > 0 and total_relevant_sell_qty > 0:
-        if total_relevant_buy_qty / total_relevant_sell_qty >= 1.2:
-            imbalance = 'BUY DOMINANT'
-        elif total_relevant_sell_qty / total_relevant_buy_qty >= 1.2:
-            imbalance = 'SELL DOMINANT'
-    elif total_relevant_buy_qty > 0:
-        imbalance = 'BUY DOMINANT (No significant sell wall/spoof)'
-    elif total_relevant_sell_qty > 0:
-        imbalance = 'SELL DOMINANT (No significant buy wall/spoof)'
-    else:
-        imbalance = 'BALANCED (No significant wall/spoof activity detected)'
-    
-    # Menambahkan detail Imbalance (total_relevant_buy_qty vs total_relevant_sell_qty)
-    imbalance += imbalance_detail
-
-    return analyzed_buy_levels, analyzed_sell_levels, imbalance
-
-def format_full_orderbook_output(levels, max_lines, side):
-    if not levels:
-        return f"Tidak ada data { 'beli' if side == 'buy' else 'jual' } orderbook yang cukup."
-
-    output_lines = ["Price → Individual Qty | Cumulative Qty | Label"]
-    
-    # Urutkan level sebelum menampilkan agar konsisten dengan tampilan Discord
-    if side == 'buy':
-        display_levels = sorted(levels, key=lambda x: x['price'], reverse=True)
-    else: # side == 'sell'
-        display_levels = sorted(levels, key=lambda x: x['price'], reverse=False)
-
-    display_count = 0
-    for item in display_levels:
-        if item['qty'] > 0: # Hanya tampilkan jika kuantitas > 0
-            label_text = f" {item['label']}" if item['label'] else ""
-            output_lines.append(f"{item['price']:,.0f} → {item['qty']:,.2f} BTC | {item['cumulative_qty']:,.2f} BTC{label_text}")
-            display_count += 1
-            if display_count >= max_lines: # Batasi jumlah baris yang ditampilkan
-                break
-
-    if display_count == 0 and len(output_lines) == 1:
-        return f"Tidak ada data { 'beli' if side == 'buy' else 'jual' } orderbook yang cukup signifikan untuk ditampilkan."
-
-    return "\n".join(output_lines)
-
-def send_to_discord(content):
-    payload = {"content": content}
-    try:
-        resp = requests.post(DISCORD_WEBHOOK_URL, data=json.dumps(payload),
-                             headers={"Content-Type": "application/json"})
-        resp.raise_for_status()
-        logging.info(f"[INFO] Pesan berhasil dikirim ke Discord. Status: {resp.status_code}")
-    except requests.exceptions.HTTPError as http_err:
-        logging.error(f"[ERROR - Discord HTTP] Gagal mengirim ke Discord: {http_err}. Response: {http_err.response.text}")
-        if http_err.response.status_code == 400:
-            logging.error("Pesan terlalu panjang atau ada masalah format. Coba kurangi MAX_DISPLAY_LINES atau periksa karakter khusus.")
-        elif http_err.response.status_code == 401 or http_err.response.status_code == 403:
-            logging.error("URL Webhook Discord tidak valid atau tidak memiliki izin yang benar.")
-    except requests.exceptions.ConnectionError as conn_err:
-        logging.error(f"[ERROR - Discord Connection] Gagal terhubung ke Discord: {conn_err}")
-    except requests.exceptions.Timeout as timeout_err:
-        logging.error(f"[ERROR - Discord Timeout] Waktu habis saat mengirim ke Discord: {timeout_err}")
-    except requests.exceptions.RequestException as req_err:
-        logging.error(f"[ERROR - Discord Request] Gagal mengirim ke Discord: {req_err}")
-    except Exception as e:
-        logging.error(f"[ERROR - Discord Unhandled] Error tak terduga saat mengirim ke Discord: {e}", exc_info=True)
-
-def get_next_candle_close_time():
-    now_utc = datetime.utcnow()
-    
-    current_quarter = now_utc.minute // 15
-    next_quarter_minute = (current_quarter + 1) * 15
-    
-    if next_quarter_minute == 60:
-        next_candle_utc = (now_utc + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
-    else:
-        next_candle_utc = now_utc.replace(minute=next_quarter_minute, second=0, microsecond=0)
-    
-    return next_candle_utc 
-
-async def wait_until_pre_close(next_candle_close_utc):
-    pre_close_time_utc = next_candle_close_utc - timedelta(minutes=1)
-
-    logging.info(f"[INFO] Pelacakan berikutnya akan dimulai pada: {pre_close_time_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC (1 menit sebelum {next_candle_close_utc.strftime('%H:%M:%S')} UTC)")
-
-    while True:
-        now_utc = datetime.utcnow()
-        if now_utc >= pre_close_time_utc:
-            logging.info(f"[INFO] Waktu pelacakan dimulai: {datetime.now().strftime('%H:%M:%S')}")
-            return next_candle_close_utc
-        await asyncio.sleep(5) 
-
-async def perform_analysis_and_send_report(spot_ob_manager, futures_ob_manager, report_time_utc, report_label):
-    wib_tz = timezone(timedelta(hours=7)) 
-    
-    managers = {'Spot': spot_ob_manager, 'Futures': futures_ob_manager}
-    for name, manager in managers.items():
-        max_retries = 3
-        for attempt in range(max_retries):
-            if manager.is_synced and not manager._closing:
-                break
-            logging.warning(f"[REPORT - {report_label}] {name} OrderBookManager belum sinkron atau sedang menutup (Percobaan {attempt+1}/{max_retries}). Mencoba memulai ulang...")
-            await manager.stop() 
-            await asyncio.sleep(3) 
-            await manager.start()
-            await asyncio.sleep(7) 
-        else: 
-            logging.error(f"[REPORT - {report_label}] {name} OrderBookManager gagal sinkron setelah {max_retries} percobaan. Tidak dapat membuat laporan.")
-            return 
-    
-    if spot_ob_manager._closing or futures_ob_manager._closing:
-        logging.warning(f"[REPORT - {report_label}] Salah satu OrderBookManager sedang dalam proses penutupan setelah retry. Melewatkan pembuatan laporan.")
-        return 
-
-    logging.info(f"[REPORT - {report_label}] Memulai pelacakan dan analisis untuk laporan.")
-    
-    spot_history, spot_snapshot_count = await track_and_analyze_orderbook_websocket(spot_ob_manager)
-    futures_history, futures_snapshot_count = await track_and_analyze_orderbook_websocket(futures_ob_manager)
-
-    if not spot_history or spot_snapshot_count == 0:
-        logging.warning(f"[REPORT - {report_label}] Tidak ada data riwayat spot yang terkumpul atau snapshot kosong. Melewatkan analisis spot.")
-        spot_buy, spot_sell, spot_imbalance = [], [], "BALANCED (No data collected)"
-    else:
-        # Menambahkan parameter is_futures di sini
-        spot_buy, spot_sell, spot_imbalance = analyze_full_orderbook(spot_history, spot_snapshot_count, is_futures=False)
-    
-    if not futures_history or futures_snapshot_count == 0:
-        logging.warning(f"[REPORT - {report_label}] Tidak ada data riwayat futures yang terkumpul atau snapshot kosong. Melewatkan analisis futures.")
-        futures_buy, futures_sell, futures_imbalance = [], [], "BALANCED (No data collected)"
-    else:
-        # Menambahkan parameter is_futures di sini
-        futures_buy, futures_sell, futures_imbalance = analyze_full_orderbook(futures_history, futures_snapshot_count, is_futures=True)
-
-    report_time_wib = report_time_utc.astimezone(wib_tz)
-    report_time_str = report_time_wib.strftime('%Y-%m-%d %H:%M WIB')
-
-    logging.info(f"[REPORT - {report_label}] Siap mengirim output untuk {PAIR} pada {report_time_str}.")
-    logging.info(f"[REPORT - {report_label}] Spot Buy Levels: {len(spot_buy)}, Sell Levels: {len(spot_sell)}, Imbalance: {spot_imbalance}")
-    logging.info(f"[REPORT - {report_label}] Futures Buy Levels: {len(futures_buy)}, Sell Levels: {len(futures_sell)}, Imbalance: {futures_imbalance}")
-
-    content = f"""
-📊 **{PAIR} — DETEKSI ORDERBOOK WALL** ⏰ Waktu: {report_time_str} ({report_label})  
-Pelacakan: {TRACK_DURATION} detik (sebelum penutupan), Real-time via WebSocket  
-
----
-
-### === ORDERBOOK SPOT ===
-
-**__**[ BUY ORDERS — {MAX_DISPLAY_LINES} LEVEL TERDEKAT ]**__**
-{format_full_orderbook_output(spot_buy, MAX_DISPLAY_LINES, 'buy')}
-
-**__**[ SELL ORDERS — {MAX_DISPLAY_LINES} LEVEL TERDEKAT ]**__**
-{format_full_orderbook_output(spot_sell, MAX_DISPLAY_LINES, 'sell')}
-
-**IMBALANCE:** {spot_imbalance}
-
----
-
-### === ORDERBOOK FUTURES ===
-
-**__**[ BUY ORDERS — {MAX_DISPLAY_LINES} LEVEL TERDEKAT ]**__**
-{format_full_orderbook_output(futures_buy, MAX_DISPLAY_LINES, 'buy')}
-
-**__**[ SELL ORDERS — {MAX_DISPLAY_LINES} LEVEL TERDEKAT ]**__**
-{format_full_orderbook_output(futures_sell, MAX_DISPLAY_LINES, 'sell')}
-
-**IMBALANCE:** {futures_imbalance}
-"""
-    send_to_discord(content)
-    logging.info(f"[REPORT - {report_label}] Laporan selesai dikirim.")
-
-# --- LOOP UTAMA ---
-async def main():
-    logging.info(f"=== {PAIR} ORDERBOOK WALL DETECTOR (SPOT + FUTURES) DIMULAI ===")
-
-    global aiohttp_session
-    aiohttp_session = aiohttp.ClientSession()
-
-    global spot_ob_manager, futures_ob_manager 
-    spot_ob_manager = OrderBookManager(PAIR + ' (Spot)', SPOT_REST_URL, SPOT_WS_URL, aiohttp_session)
-    futures_ob_manager = OrderBookManager(PAIR + ' (Futures)', FUTURES_REST_URL, FUTURES_WS_URL, aiohttp_session, is_futures=True)
-
-    await spot_ob_manager.start()
-    await futures_ob_manager.start()
-
-    logging.info("Memberi waktu 10 detik agar WebSocket terhubung dan sync initial snapshot...")
-    await asyncio.sleep(10) 
-
-    logging.info("[MAIN] Melakukan pengiriman laporan awal dengan data terkini...")
-    wib_tz_for_now = timezone(timedelta(hours=7))
-    await perform_analysis_and_send_report(spot_ob_manager, futures_ob_manager, datetime.now(wib_tz_for_now), "Laporan Awal (Data Terkini)")
-    logging.info("[MAIN] Laporan awal selesai dikirim. Melanjutkan ke siklus terjadwal.")
-
-    while True:
-        try:
-            for name, manager in {'Spot': spot_ob_manager, 'Futures': futures_ob_manager}.items():
-                # Pastikan manager saat ini yang digunakan, bukan global variable yang mungkin di-reassign
-                current_manager = spot_ob_manager if name == 'Spot' else futures_ob_manager
-                if not current_manager.is_synced:
-                    logging.warning(f"[MAIN LOOP] {name} OrderBookManager terdeteksi UNSYNCED. Memaksa restart penuh...")
-                    await current_manager.stop()
-                    # Re-create the manager object to ensure a clean state
-                    if name == 'Spot':
-                        spot_ob_manager = OrderBookManager(PAIR + ' (Spot)', SPOT_REST_URL, SPOT_WS_URL, aiohttp_session)
-                    else: # Futures
-                        futures_ob_manager = OrderBookManager(PAIR + ' (Futures)', FUTURES_REST_URL, FUTURES_WS_URL, aiohttp_session, is_futures=True)
-                    await (spot_ob_manager if name == 'Spot' else futures_ob_manager).start() # Start the newly created/updated manager
-                    await asyncio.sleep(10) 
-                    # Re-check sync status after restart
-                    if not (spot_ob_manager if name == 'Spot' else futures_ob_manager).is_synced: 
-                        logging.error(f"[MAIN LOOP] {name} OrderBookManager GAGAL sinkron setelah restart penuh. Akan mencoba lagi di siklus berikutnya.")
-                        continue 
-
-            next_close_time_utc = get_next_candle_close_time()
-            await wait_until_pre_close(next_close_time_utc)
-            
-            await perform_analysis_and_send_report(spot_ob_manager, futures_ob_manager, next_close_time_utc, "Penutupan Lilin 15m")
-            
-            logging.info(f"[INFO] Siklus deteksi selesai. Menunggu siklus berikutnya...\n")
-            
-            now_after_send = datetime.utcnow()
-            next_tracking_start_utc = (next_close_time_utc + timedelta(minutes=15)) - timedelta(minutes=1)
-            sleep_duration_seconds = (next_tracking_start_utc - now_after_send).total_seconds()
-
-            if sleep_duration_seconds > 0:
-                logging.info(f"[INFO] Tidur selama {int(sleep_duration_seconds)} detik sampai waktu pelacakan berikutnya.")
-                await asyncio.sleep(sleep_duration_seconds)
-            else:
-                logging.warning("[WARNING] Waktu tidur negatif atau nol. Tidur 60 detik sebagai fallback.")
-                await asyncio.sleep(60)
-        
-        except RecursionError as re: 
-            logging.critical(f"[ERROR - Main Loop FATAL] RecursionError terdeteksi: {re}. Bot akan mencoba restart total.")
-            try:
-                if aiohttp_session and not aiohttp_session.closed:
-                    await aiohttp_session.close()
-                if spot_ob_manager: await spot_ob_manager.stop()
-                if futures_ob_manager: await futures_ob_manager.stop()
-                await asyncio.sleep(15) 
+        for side, book in [('ask', asks), ('bid', bids)]:
+            for price, qty in book:
+                if price <= 0 or qty <= 0:
+                    logging.debug(f"Mengabaikan entri orderbook tidak valid: Price={price}, Qty={qty} dari {name}")
+                    continue
                 
-                aiohttp_session = aiohttp.ClientSession()
-                spot_ob_manager = OrderBookManager(PAIR + ' (Spot)', SPOT_REST_URL, SPOT_WS_URL, aiohttp_session)
-                futures_ob_manager = OrderBookManager(PAIR + ' (Futures)', FUTURES_REST_URL, FUTURES_WS_URL, aiohttp_session, is_futures=True)
-                await spot_ob_manager.start()
-                await futures_ob_manager.start()
-                await asyncio.sleep(15) 
-                logging.info("[MAIN] Bot berhasil restart setelah RecursionError.")
-            except Exception as restart_e:
-                logging.error(f"[ERROR - Main Loop Restart FATAL] Gagal me-restart bot setelah RecursionError: {restart_e}", exc_info=True)
-                logging.error("Bot mungkin perlu dihentikan dan dijalankan ulang secara manual.")
-                await asyncio.sleep(120) 
+                level = group_price(price)
+                key = (level, side)
+                
+                if key not in grouped:
+                    grouped[key] = {'total_spot': 0.0, 'total_futures': 0.0, 'exchanges': {}}
+                
+                # Tambahkan kuantitas ke total spot/futures
+                if spot:
+                    grouped[key]['total_spot'] += float(qty)
+                else:
+                    grouped[key]['total_futures'] += float(qty)
+                
+                # Simpan kuantitas per bursa untuk deteksi wall
+                exchange_type_key = f"{name} {'(Spot)' if spot else '(Futures)'}"
+                if exchange_type_key not in grouped[key]['exchanges']:
+                    grouped[key]['exchanges'][exchange_type_key] = 0.0
+                grouped[key]['exchanges'][exchange_type_key] += float(qty)
+                
+    logging.info(f"Berhasil menggabungkan {len(all_books)} order book, menghasilkan {len(grouped)} level harga yang dikelompokkan.")
+    return grouped
+
+
+def detect_wall(grouped: dict) -> list:
+    """
+    Mendeteksi 'order wall' (akumulasi kuantitas besar) berdasarkan deviasi standar dari kuantitas.
+    Kuantitas yang melebihi rata-rata + 2 * deviasi standar dianggap sebagai wall.
+    Menyertakan informasi bursa yang dominan.
+    """
+    all_quantities = [data['total_spot'] + data['total_futures'] for data in grouped.values()]
+    if not all_quantities:
+        logging.info("Tidak ada kuantitas terdeteksi untuk analisis wall.")
+        return []
+    
+    avg = np.mean(all_quantities)
+    std = np.std(all_quantities)
+    # Ambang batas untuk deteksi wall: rata-rata + 2 * deviasi standar
+    # Anda bisa menyesuaikan faktor 2 ini (misal 1.5, 3) untuk sensitivitas yang berbeda
+    threshold = avg + 2 * std
+    
+    walls = []
+    for (p, s), data in grouped.items():
+        total_qty = data['total_spot'] + data['total_futures']
+        if total_qty > threshold:
+            # Temukan bursa dengan kontribusi kuantitas terbesar di level ini
+            top_exchanges = sorted(data['exchanges'].items(), key=lambda item: item[1], reverse=True)
+            
+            exchange_info = ""
+            if top_exchanges:
+                # Ambil bursa yang menyumbang minimal 20% dari total kuantitas wall, atau bursa teratas jika tidak ada yang mencapai 20%
+                significant_exchanges = [
+                    f"{name.replace(' (Spot)', '').replace(' (Futures)', '')} {'(Spot)' if '(Spot)' in name else '(Futures)' if '(Futures)' in name else ''}"
+                    for name, qty in top_exchanges if qty / total_qty >= 0.2
+                ]
+                if not significant_exchanges and top_exchanges:
+                    significant_exchanges = [
+                        f"{top_exchanges[0][0].replace(' (Spot)', '').replace(' (Futures)', '')} {'(Spot)' if '(Spot)' in top_exchanges[0][0] else '(Futures)' if '(Futures)' in top_exchanges[0][0] else ''}"
+                    ]
+
+                if significant_exchanges:
+                    exchange_info = f" ({', '.join(significant_exchanges)})"
+
+            walls.append((p, s, total_qty, exchange_info))
+    
+    if walls:
+        logging.info(f"Deteksi {len(walls)} order wall dengan ambang batas {threshold:.2f} BTC.")
+    else:
+        logging.info("Tidak ada order wall signifikan terdeteksi.")
+    return walls
+
+def compute_imbalance(grouped: dict) -> tuple:
+    """
+    Menghitung ketidakseimbangan order book antara total kuantitas bid dan ask.
+    Imbalance = (Total Bid - Total Ask) / (Total Bid + Total Ask)
+    """
+    bid_total = sum(data['total_spot'] + data['total_futures'] for k, data in grouped.items() if k[1] == 'bid')
+    ask_total = sum(data['total_spot'] + data['total_futures'] for k, data in grouped.items() if k[1] == 'ask')
+    
+    if bid_total + ask_total == 0:
+        logging.warning("Total kuantitas bid dan ask adalah nol, ketidakseimbangan tidak dapat dihitung.")
+        return 0.0, bid_total, ask_total
+    
+    imbalance_score = (bid_total - ask_total) / (bid_total + ask_total)
+    logging.info(f"Ketidakseimbangan order book: {imbalance_score:+.2f} (Bid: {bid_total:.2f}, Ask: {ask_total:.2f})")
+    return imbalance_score, bid_total, ask_total
+
+# --- FUNGSI KIRIM PESAN DISCORD ---
+async def send_to_discord(content: str):
+    """
+    Mengirim pesan teks ke Discord Webhook.
+    """
+    if not DISCORD_WEBHOOK_URL or DISCORD_WEBHOOK_URL == "YOUR_WEBHOOK_URL_HERE":
+        logging.error("DISCORD_WEBHOOK_URL belum dikonfigurasi. Pesan tidak terkirim.")
+        return
+
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.post(DISCORD_WEBHOOK_URL, json={"content": content}) as resp:
+                resp.raise_for_status()
+                logging.info("Pesan berhasil dikirim ke Discord.")
+        except aiohttp.ClientResponseError as e:
+            logging.error(f"Gagal mengirim pesan ke Discord: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                logging.error(f"Respons Discord: {e.response.status} - {await e.response.text()}")
         except Exception as e:
-            logging.error(f"[ERROR - Main Loop] Error tak terduga dalam siklus utama: {e}", exc_info=True)
-            logging.info("Mencoba me-restart OrderBookManager untuk pemulihan...")
-            
-            try:
-                if spot_ob_manager: await spot_ob_manager.stop()
-                if futures_ob_manager: await futures_ob_manager.stop()
-                await asyncio.sleep(5)
-                
-                spot_ob_manager = OrderBookManager(PAIR + ' (Spot)', SPOT_REST_URL, SPOT_WS_URL, aiohttp_session)
-                futures_ob_manager = OrderBookManager(PAIR + ' (Futures)', FUTURES_REST_URL, FUTURES_WS_URL, aiohttp_session, is_futures=True)
-                await spot_ob_manager.start()
-                await futures_ob_manager.start()
-                await asyncio.sleep(10)
-            except Exception as restart_e:
-                logging.error(f"[ERROR - Main Loop Restart] Gagal me-restart OrderBookManager: {restart_e}", exc_info=True)
-                await asyncio.sleep(60)
+            logging.error(f"Kesalahan tidak terduga saat mengirim ke Discord: {e}", exc_info=True)
 
-# Global references for cleanup_on_exit
-spot_ob_manager = None
-futures_ob_manager = None
-aiohttp_session = None 
+def format_output(current_spot_price: float, current_futures_price: float, grouped: dict, walls: list, imbalance: tuple) -> str:
+    """
+    Memformat ringkasan order book menjadi string yang mudah dibaca untuk pesan Discord.
+    Akan menggabungkan kuantitas spot dan futures menjadi satu kolom 'Total Qty'.
+    """
+    lines = [
+        f"📊 **BTC/USDT Order Book Snapshot** (Grouped by `${PRICE_INTERVAL}`)",
+        f"🕒 {utc_now()}\n",
+        f"💰 **Harga Terkini (Bid Tertinggi Rata-rata):**",
+        f"**Spot** : `${current_spot_price:.2f}`",
+        f"**Futures**: `${current_futures_price:.2f}`  (`{'+' if (current_futures_price - current_spot_price) > 0 else ''}${(current_futures_price - current_spot_price):.2f}` Premium)\n",
+        f"📦 **ASK (Jual) - Harga | Total BTC Qty**"
+    ]
 
-if __name__ == '__main__':
-    if DISCORD_WEBHOOK_URL == 'https://discord.com/api/webhooks/YOUR_DISCORD_WEBHOOK_URL_HERE':
-        logging.error("PENTING: Harap ganti 'https://discord.com/api/webhooks/YOUR_DISCORD_WEBHOOK_URL_HERE' dengan URL webhook Discord Anda yang valid di bagian KONFIGURASI!")
-        exit()
-    
-    async def cleanup_on_exit_global():
-        if spot_ob_manager:
-            await spot_ob_manager.stop()
-        if futures_ob_manager:
-            await futures_ob_manager.stop()
-        if aiohttp_session and not aiohttp_session.closed:
-            await aiohttp_session.close() 
-        logging.info("Global managers and aiohttp session cleanup completed.")
+    ask_levels_sorted = sorted(set(p for (p, s) in grouped if s == 'ask'))
+    for level in ask_levels_sorted[:TOP_LEVELS]:
+        data = grouped.get((level, 'ask'), {'total_spot': 0, 'total_futures': 0})
+        total_qty = data['total_spot'] + data['total_futures'] # Summing spot and futures quantities
+        lines.append(f"`{level:<10}` `{format_volume(total_qty):<12}`")
 
+    lines.append("\n📥 **BID (Beli) - Harga | Total BTC Qty**")
+    bid_levels_sorted = sorted(set(p for (p, s) in grouped if s == 'bid'), reverse=True)
+    for level in bid_levels_sorted[:TOP_LEVELS]:
+        data = grouped.get((level, 'bid'), {'total_spot': 0, 'total_futures': 0})
+        total_qty = data['total_spot'] + data['total_futures'] # Summing spot and futures quantities
+        lines.append(f"`{level:<10}` `{format_volume(total_qty):<12}`")
+
+    if walls:
+        lines.append("\n🧱 **Order Walls Terdeteksi:**")
+        for p, s, total_qty, exchange_info in walls:
+            lines.append(f"{'🔻' if s == 'ask' else '🔺'} {s.capitalize()} Wall di `${p}`{exchange_info} → `{total_qty:.2f} BTC`")
+    else:
+        lines.append("\n_Tidak ada order wall signifikan terdeteksi._")
+
+    imbalance_score, bid_qty, ask_qty = imbalance
+    imbalance_emoji = '⚪ Netral'
+    if imbalance_score > 0.1:
+        imbalance_emoji = '🟢 Pembelian Dominan'
+    elif imbalance_score < -0.1:
+        imbalance_emoji = '🔴 Penjualan Dominan'
+
+    lines.append("\n📊 **Ketidakseimbangan Order Book** (Top Levels):")
+    lines.append(f"`{imbalance_emoji}` (`{imbalance_score:+.2f}`)")
+    lines.append(f"Total Kuantitas Bid : `{bid_qty:.2f} BTC`")
+    lines.append(f"Total Kuantitas Ask : `{ask_qty:.2f} BTC`")
+
+    lines.append("\n_Catatan: Data kuantitas (Qty) ini adalah snapshot dari order book yang terbuka, bukan volume perdagangan historis._")
+
+    return "\n".join(lines)
+
+# --- FUNGSI UTAMA (MAIN LOOP) ---
+async def main_loop():
+    """
+    Fungsi utama yang menjalankan siklus pemantauan, pengambilan, pemrosesan,
+    dan pengiriman data order book.
+    """
+    if not EXCHANGES:
+        logging.critical("Konfigurasi bursa kosong. Skrip tidak dapat berjalan.")
+        return
+
+    logging.info("Memulai pemantau order book BTC/USDT multi-bursa.")
+    while True:
+        # Hitung waktu penutupan candle berikutnya
+        next_send_time = calculate_next_candle_close_time(CANDLE_INTERVAL_MINUTES)
+        
+        # Hitung durasi tidur hingga waktu pengiriman berikutnya
+        now_utc = datetime.datetime.now(pytz.UTC)
+        sleep_duration_initial = (next_send_time - now_utc).total_seconds()
+        
+        if sleep_duration_initial > 0:
+            logging.info(f"Menunggu {sleep_duration_initial:.2f} detik hingga penutupan candle 15 menit berikutnya ({next_send_time.strftime('%Y-%m-%d %H:%M:%S UTC')}).")
+            await asyncio.sleep(sleep_duration_initial)
+        else:
+            # Jika skrip dimulai tepat setelah waktu penutupan atau agak terlambat,
+            # langsung lanjutkan atau tunggu sebentar ke siklus berikutnya.
+            logging.info("Waktu penutupan candle 15 menit telah berlalu atau segera tiba. Melanjutkan ke pengambilan data.")
+            # Beri jeda kecil untuk memastikan candle benar-benar "tutup" dan API mungkin diperbarui
+            await asyncio.sleep(5) # Jeda 5 detik setelah waktu target
+
+        start_fetch_time = datetime.datetime.now()
+        logging.info(f"Memulai siklus pengambilan data baru pada {start_fetch_time.strftime('%Y-%m-%d %H:%M:%S')}. Ini akan disinkronkan dengan penutupan candle 15 menit Binance.")
+        
+        all_books_data = []
+        async with aiohttp.ClientSession() as session:
+            tasks = [fetch_orderbook(session, name, config) for name, config in EXCHANGES.items()]
+            all_books_data = await asyncio.gather(*tasks)
+
+        valid_books = [book for book in all_books_data if book[2] or book[3]]
+
+        if not valid_books:
+            logging.error("Tidak ada data order book yang valid berhasil diambil dari bursa manapun. Mencoba lagi di siklus berikutnya.")
+            # Jika gagal, tetap coba lagi pada penutupan candle berikutnya.
+            continue
+
+        # Inisialisasi harga default jika tidak ada data yang ditemukan
+        current_spot_price = 0.0
+        current_futures_price = 0.0
+
+        spot_prices_fetched = []
+        futures_prices_fetched = []
+
+        # Kumpulkan harga bid tertinggi dari setiap bursa yang valid
+        for name, is_spot, asks, bids in valid_books:
+            if bids: # Pastikan ada bid
+                # Ambil bid tertinggi (harga terbaik pembeli) sebagai representasi harga saat ini
+                if is_spot:
+                    spot_prices_fetched.append(bids[0][0])
+                else:
+                    futures_prices_fetched.append(bids[0][0])
+
+        if spot_prices_fetched:
+            current_spot_price = sum(spot_prices_fetched) / len(spot_prices_fetched)
+        else:
+            logging.warning("Harga spot tidak dapat ditentukan (mungkin semua bursa spot gagal diambil).")
+
+        if futures_prices_fetched:
+            current_futures_price = sum(futures_prices_fetched) / len(futures_prices_fetched)
+        else:
+            # Jika tidak ada harga futures yang berhasil diambil, gunakan harga spot sebagai fallback
+            current_futures_price = current_spot_price if current_spot_price != 0 else 0.0
+            if current_futures_price == 0:
+                logging.warning("Harga futures tidak dapat ditentukan (mungkin semua bursa futures gagal diambil dan harga spot juga tidak ada).")
+
+
+        grouped_order_book = aggregate_orderbooks(valid_books)
+        
+        walls_detected = detect_wall(grouped_order_book)
+        imbalance_result = compute_imbalance(grouped_order_book)
+
+        message_content = format_output(current_spot_price, current_futures_price, grouped_order_book, walls_detected, imbalance_result)
+        await send_to_discord(message_content)
+
+        end_fetch_time = datetime.datetime.now()
+        fetch_duration = (end_fetch_time - start_fetch_time).total_seconds()
+        logging.info(f"Pengambilan dan pengolahan data selesai dalam {fetch_duration:.2f} detik.")
+        
+        # Siklus akan kembali ke awal untuk menghitung waktu tidur berikutnya
+        # sehingga selalu sinkron dengan penutupan candle
+        
+# --- JALANKAN SKRIP ---
+if __name__ == "__main__":
     try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logging.info("Bot dihentikan oleh pengguna (KeyboardInterrupt). Melakukan cleanup...")
-        try:
-            loop = asyncio.get_running_loop()
-            if loop.is_running():
-                # Schedule the cleanup task and wait for it to complete or for a short duration
-                loop.create_task(cleanup_on_exit_global())
-                loop.run_until_complete(asyncio.sleep(3)) # Give some time for cleanup to run
-            else:
-                asyncio.run(cleanup_on_exit_global())
-        except RuntimeError: 
-             asyncio.run(cleanup_on_exit_global()) # Fallback for already closed loop
-        except Exception as cleanup_e:
-            logging.error(f"Error during cleanup_on_exit: {cleanup_e}", exc_info=True)
-
+        asyncio.run(main_loop())
+    except KeyboardInterrupt: # Baris 439
+        logging.info("Skrip dihentikan secara manual (Ctrl+C).")
     except Exception as e:
-        logging.error(f"Error fatal di luar main loop: {e}", exc_info=True)
+        logging.critical(f"Kesalahan fatal pada main loop: {e}", exc_info=True)
+
