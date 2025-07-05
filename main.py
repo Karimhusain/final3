@@ -32,7 +32,7 @@ MAX_DISPLAY_LINES = 5 # Ditingkatkan agar bisa melihat lebih banyak 'wall'
 TRACK_INTERVAL = 3
 TRACK_DURATION = 60
 
-DISCORD_WEBHOOK_URL = 'https://discord.com/api/webhooks/1385219307608346634/-1sAEFdJ6V5rqFqFc7DSBhpIgqNXymoQOxsGERka-cplGJkcacYqGWlTk44BddYamOOz'
+DISCORD_WEBHOOK_URL = 'https://discord.com/api/webhooks/1390653204903104595/tRtyISpu-RaH_p1UtrhDJRzCW2Vtrh_SrKCd5ivfMk-vOB7oVzHlSkl4esTfZiItmmg0'
 
 # --- KONFIGURASI LOGGING ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
